@@ -1,0 +1,630 @@
+const { z } = require("zod");
+const crypto = require("crypto");
+const User = require("../models/User");
+const SupportTicket = require("../models/SupportTicket");
+const { Booking } = require("../models/Booking");
+const { emitAdminEvent } = require("../sockets/bookingSocket");
+const { normalizeDeviceToken, upsertDeviceToken } = require("../utils/notificationTokens");
+const { sendWelcomeEmail } = require("../utils/welcomeEmail");
+const { admin, initFirebase } = require("../config/firebase");
+const { nextPublicId } = require("../utils/publicIds");
+const { supportBotReply } = require("../utils/supportBot");
+const { isPlaceholderCustomerName, firstRealCustomerName } = require("../utils/customerIdentity");
+
+const profileSchema = z.object({
+  name: z.string().trim().min(1).max(120).optional(),
+  fullName: z.string().trim().min(1).max(120).optional(),
+  displayName: z.string().trim().min(1).max(120).optional(),
+  phone: z.string().trim().max(20).optional(),
+  email: z.string().trim().email().max(180).optional().or(z.literal("")),
+  profilePhotoUrl: z.string().trim().max(1200).optional(),
+  address: z.string().trim().max(700).optional(),
+  savedAddresses: z.array(z.object({
+    label: z.string().trim().max(80).optional(),
+    address: z.string().trim().max(700),
+    city: z.string().trim().max(80).optional(),
+    lat: z.coerce.number().min(-90).max(90).optional(),
+    lng: z.coerce.number().min(-180).max(180).optional(),
+    isDefault: z.boolean().optional()
+  })).max(20).optional(),
+  city: z.string().trim().max(80).optional(),
+  lat: z.coerce.number().min(-90).max(90).optional(),
+  lng: z.coerce.number().min(-180).max(180).optional(),
+  fcmToken: z.string().trim().max(4096).optional(),
+  deviceInfo: z.record(z.string(), z.unknown()).optional()
+});
+
+const deletionRequestSchema = z.object({
+  reason: z.string().trim().max(500).optional()
+});
+
+const supportTicketSyncSchema = z.object({
+  ticketId: z.string().trim().min(3).max(120).optional(),
+  clientMessageId: z.string().trim().max(160).optional(),
+  senderRole: z.enum(["user", "ai", "support", "system"]).default("user"),
+  senderName: z.string().trim().max(120).optional(),
+  message: z.string().trim().min(1).max(3000),
+  category: z.string().trim().max(80).optional(),
+  priority: z.enum(["low", "normal", "medium", "high", "urgent"]).optional(),
+  bookingId: z.string().trim().max(120).optional(),
+  bookingCode: z.string().trim().max(120).optional(),
+  aiSummary: z.string().trim().max(3000).optional(),
+  attachmentUrl: z.string().trim().max(2000).optional(),
+  attachmentName: z.string().trim().max(255).optional(),
+  attachmentMimeType: z.string().trim().max(120).optional(),
+  platform: z.enum(["android", "ios"]).default("android"),
+  serverBot: z.boolean().default(false)
+});
+
+const userActivitySchema = z.object({
+  event: z.enum(["service_clicked", "screen_view"]),
+  platform: z.enum(["android", "ios"]),
+  screen: z.string().trim().max(80).optional().default(""),
+  serviceId: z.string().trim().max(120).optional().default(""),
+  serviceName: z.string().trim().max(180).optional().default(""),
+  category: z.string().trim().max(120).optional().default("")
+});
+
+function normalizePhone(value) {
+  return String(value || "").replace(/\D/g, "").slice(-10);
+}
+
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function identityHash(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return "";
+  const secret = process.env.IDENTITY_HASH_PEPPER || process.env.ENCRYPTION_KEY || "apnaservo-dev-identity-hash";
+  return crypto.createHmac("sha256", secret).update(normalized).digest("hex");
+}
+
+function tokenPhoneVerified(req, phone) {
+  const tokenPhone = normalizePhone(req.auth?.phone_number);
+  const profilePhone = normalizePhone(phone);
+  return tokenPhone.length === 10 && profilePhone.length === 10 && tokenPhone === profilePhone;
+}
+
+function supportCategory(message, requested) {
+  if (requested) return requested.toLowerCase();
+  const text = String(message || "").toLowerCase();
+  if (text.includes("payment") || text.includes("refund") || text.includes("bill")) return "payments";
+  if (text.includes("booking") || text.includes("cancel") || text.includes("partner")) return "bookings";
+  if (text.includes("complaint") || text.includes("behaviour") || text.includes("quality")) return "complaint";
+  if (text.includes("login") || text.includes("app") || text.includes("technical")) return "technical";
+  return "general";
+}
+
+function supportPriority(message, requested) {
+  if (requested) return requested;
+  const text = String(message || "").toLowerCase();
+  if (text.includes("emergency") || text.includes("fraud") || text.includes("unsafe")) return "urgent";
+  if (text.includes("complaint") || text.includes("refund") || text.includes("not received")) return "high";
+  return "normal";
+}
+
+async function resolveBooking(rawId, rawCode, userId) {
+  const id = String(rawId || "").trim();
+  const code = String(rawCode || "").trim();
+  const filters = [];
+  if (id && require("mongoose").isValidObjectId(id)) filters.push({ _id: id });
+  if (id) filters.push({ bookingCode: id });
+  if (code) filters.push({ bookingCode: code });
+  if (!filters.length) return null;
+  return Booking.findOne({ userId, $or: filters }).select("_id bookingId publicId bookingCode");
+}
+
+async function upsertProfile(req, res, next) {
+  try {
+    const body = profileSchema.parse(req.body || {});
+    const requestedPhone = body.phone || req.auth.phone_number || "";
+    const existing = await User.findOne({ firebaseUid: req.auth.uid })
+      .select("_id name phone")
+      .lean();
+    // A verified identity is immutable after registration. Profile updates may
+    // change contact email and other preferences, but never name or mobile.
+    const phone = existing?.phone || requestedPhone;
+    const normalizedPhone = normalizePhone(phone);
+    const email = normalizeEmail(body.email !== undefined ? body.email : req.auth.email || "");
+    const verified = tokenPhoneVerified(req, phone);
+    const now = new Date();
+    const update = {
+      firebaseUid: req.auth.uid,
+      bookingRiskStatus: verified ? "trusted" : "otp_required",
+      lastLoginAt: now
+    };
+
+    const existingName = String(existing?.name || "").trim();
+    const requestedName = firstRealCustomerName(body.name, body.fullName, body.displayName, req.auth.name);
+    if (isPlaceholderCustomerName(existingName) && requestedName) {
+      update.name = requestedName;
+    }
+    if (!existing?.phone && phone) {
+      update.phone = phone;
+      if (normalizedPhone.length === 10) update.phoneHash = identityHash(normalizedPhone);
+    }
+    if (body.email !== undefined || req.auth.email) {
+      update.email = email;
+      update.emailHash = identityHash(email);
+    }
+    if (body.profilePhotoUrl || req.auth.picture) update.profilePhotoUrl = body.profilePhotoUrl || req.auth.picture;
+    if (body.address !== undefined && body.address) update.address = body.address;
+    if (body.city) update.city = body.city;
+    if (body.fcmToken) update.fcmToken = body.fcmToken;
+    if (body.deviceInfo) update.deviceInfo = body.deviceInfo;
+    if (verified) {
+      update.phoneVerified = true;
+      update.phoneVerifiedAt = new Date();
+    } else {
+      update.phoneVerified = false;
+      update.phoneVerifiedAt = null;
+    }
+    const hasUsableLocation = Number.isFinite(body.lat) && Number.isFinite(body.lng)
+      && !(body.lat === 0 && body.lng === 0)
+      && !(Math.abs(body.lat - 26.1445) <= 0.0002 && Math.abs(body.lng - 91.7362) <= 0.0002);
+    if (hasUsableLocation) {
+      update.location = { type: "Point", coordinates: [body.lng, body.lat] };
+    }
+    if (body.savedAddresses) {
+      update.savedAddresses = body.savedAddresses.map((entry) => ({
+        label: entry.label || "Saved",
+        address: entry.address,
+        city: entry.city || body.city || "Guwahati",
+        location: {
+          type: "Point",
+          coordinates: [Number.isFinite(entry.lng) ? entry.lng : 0, Number.isFinite(entry.lat) ? entry.lat : 0]
+        },
+        isDefault: Boolean(entry.isDefault),
+        updatedAt: now
+      }));
+    }
+
+    const user = await User.findOneAndUpdate(
+      { firebaseUid: req.auth.uid },
+      {
+        $set: update,
+        $setOnInsert: {
+          registrationHistory: [{
+            source: "user_app",
+            provider: "firebase",
+            registeredAt: now,
+            ip: req.ip || "",
+            userAgent: req.get("user-agent") || ""
+          }]
+        },
+        $push: {
+          loginHistory: {
+            $each: [{
+              loggedInAt: now,
+              ip: req.ip || "",
+              userAgent: req.get("user-agent") || "",
+              deviceInfo: body.deviceInfo || {}
+            }],
+            $slice: -50
+          }
+        }
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    if (!existing) {
+      emitAdminEvent("user:registered", {
+        userId: String(user._id),
+        name: user.name,
+        phone: user.phone,
+        email: user.email,
+        createdAt: user.createdAt
+      });
+    }
+    let welcomeEmailResult = null;
+    if (!user.welcomeEmailSentAt) {
+      welcomeEmailResult = await sendWelcomeEmail({ to: user.email, name: user.name, audience: "customer" });
+      const emailResult = welcomeEmailResult;
+      if (emailResult.sent) {
+        user.welcomeEmailSentAt = new Date();
+        await user.save();
+      }
+    }
+
+    const response = { user };
+    if (req.authType === "development_device" && req.get("x-apnaservo-mail-debug") === "true") {
+      response.mailDebug = welcomeEmailResult
+        ? {
+            sent: Boolean(welcomeEmailResult.sent),
+            skipped: Boolean(welcomeEmailResult.skipped),
+            error: welcomeEmailResult.error || ""
+          }
+        : { sent: false, skipped: true, error: "welcome email was already marked as sent" };
+    }
+    return res.json(response);
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function me(req, res, next) {
+  try {
+    const user = await User.findOne({ firebaseUid: req.auth.uid });
+    return res.json({ user });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function saveFcmToken(req, res, next) {
+  try {
+    const token = String(req.body?.fcmToken || "").trim();
+    const deviceToken = normalizeDeviceToken({
+      token,
+      platform: req.body?.platform || "android",
+      deviceId: req.body?.deviceId || "",
+      appType: "user"
+    });
+    if (!deviceToken) {
+      return res.status(400).json({ message: "Valid FCM token is required" });
+    }
+    const insertPhone = req.auth.phone_number || "";
+    const insertPhoneHash = normalizePhone(insertPhone).length === 10 ? identityHash(normalizePhone(insertPhone)) : "";
+    const insertEmail = normalizeEmail(req.auth.email || "");
+    const user = await User.findOneAndUpdate(
+      { firebaseUid: req.auth.uid },
+      {
+        $setOnInsert: {
+          firebaseUid: req.auth.uid,
+          name: firstRealCustomerName(req.body?.name, req.body?.fullName, req.body?.displayName, req.auth.name) || "ApnaServo Customer",
+          phone: insertPhone,
+          phoneHash: insertPhoneHash,
+          email: insertEmail,
+          emailHash: identityHash(insertEmail),
+          city: "Guwahati"
+        }
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    upsertDeviceToken(user, deviceToken);
+    await user.save();
+    return res.json({ ok: true, userId: user._id });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function syncSupportTicket(req, res, next) {
+  try {
+    const body = supportTicketSyncSchema.parse(req.body || {});
+    const user = await User.findOne({ firebaseUid: req.auth.uid });
+    if (!user) {
+      return res.status(404).json({ message: "Customer profile not found" });
+    }
+
+    const booking = await resolveBooking(body.bookingId, body.bookingCode, user._id);
+    const now = new Date();
+    const attachment = body.attachmentUrl ? {
+      name: body.attachmentName || "Customer attachment",
+      url: body.attachmentUrl,
+      mimeType: body.attachmentMimeType || "image/jpeg",
+      uploadedAt: now
+    } : null;
+    let ticket = body.ticketId
+      ? await SupportTicket.findOne({
+        userId: user._id,
+        $or: [{ ticketCode: body.ticketId }, { publicId: body.ticketId.toUpperCase() }]
+      })
+      : null;
+    const isNew = !ticket;
+
+    if (!ticket) {
+      if (body.senderRole !== "user") {
+        return res.status(400).json({ message: "A customer complaint is required to create a support ticket" });
+      }
+      const officialTicketId = await nextPublicId("userComplaint");
+      ticket = new SupportTicket({
+        ticketCode: officialTicketId,
+        publicId: officialTicketId,
+        userId: user._id,
+        bookingId: booking?._id || null,
+        bookingCode: booking?.bookingId || booking?.publicId || booking?.bookingCode || body.bookingCode || "",
+        userName: user.name || "",
+        mobileNumber: user.phone || "",
+        email: user.email || "",
+        category: supportCategory(body.message, body.category),
+        priority: supportPriority(body.message, body.priority),
+        status: "open",
+        source: "ai_support",
+        complaint: body.message,
+        aiSummary: body.aiSummary || `AI Support captured a ${supportCategory(body.message, body.category)} issue from ${user.name || "the customer"}.`,
+        timeline: [{ event: "ticket_created", by: "ai_support", note: "Ticket synced from User App", at: now }],
+        lastUpdatedAt: now
+      });
+    }
+
+    const duplicate = body.clientMessageId
+      && ticket.conversation.some((entry) => entry.clientMessageId === body.clientMessageId);
+    if (!duplicate) {
+      ticket.conversation.push({
+        clientMessageId: body.clientMessageId || "",
+        senderRole: body.senderRole,
+        senderName: body.senderName || (body.senderRole === "ai" ? "ApnaServo AI Support" : user.name),
+        message: body.message,
+        attachments: attachment ? [attachment] : [],
+        createdAt: now
+      });
+      ticket.timeline.push({
+        event: body.senderRole === "user" ? "customer_message" : `${body.senderRole}_message`,
+        by: body.senderRole,
+        note: body.message.slice(0, 180),
+        at: now
+      });
+      if (body.senderRole === "user") ticket.adminUnreadCount = Number(ticket.adminUnreadCount || 0) + 1;
+    }
+    if (attachment && !ticket.attachments.some((entry) => entry.url === attachment.url)) {
+      ticket.attachments.push(attachment);
+    }
+    if (booking && !ticket.bookingId) {
+      ticket.bookingId = booking._id;
+      ticket.bookingCode = booking.bookingId || booking.publicId || booking.bookingCode;
+    }
+    if (body.senderRole === "user" && body.aiSummary) ticket.aiSummary = body.aiSummary;
+    if (!duplicate && body.senderRole === "user" && ["resolved", "closed"].includes(ticket.status)) {
+      ticket.status = "reopened";
+      ticket.reopenedAt = now;
+      ticket.timeline.push({ event: "reopened", by: "user", note: "Customer sent a new message", at: now });
+    }
+    let bot = null;
+    // Android's released client already owns its bot turn. Only clients that
+    // explicitly opt into the server bot receive an automatic reply, avoiding
+    // duplicate Android messages while iOS migrates to backend-driven replies.
+    if (!duplicate && body.senderRole === "user" && body.serverBot) {
+      bot = await supportBotReply(body.message, body.platform);
+      if (bot.enabled) {
+        ticket.conversation.push({
+          clientMessageId: `bot:${body.clientMessageId || crypto.randomUUID()}`,
+          senderRole: "ai",
+          senderName: "ApnaServo Support Assistant",
+          message: bot.reply,
+          attachments: [],
+          createdAt: new Date(now.getTime() + 1)
+        });
+        ticket.timeline.push({ event: "ai_message", by: "ai_support", note: `${bot.intent}: ${bot.reply.slice(0, 140)}`, at: now });
+        ticket.userUnreadCount = Number(ticket.userUnreadCount || 0) + 1;
+        ticket.aiSummary = `AI classified the latest customer message as ${bot.intent}. Human support can review the full conversation.`;
+      }
+    }
+    ticket.lastUpdatedAt = now;
+    await ticket.save();
+
+    emitAdminEvent(isNew ? "support:ticket_created" : "support:ticket_updated", {
+      ticketId: ticket.publicId || ticket.ticketCode,
+      publicId: ticket.publicId || "",
+      correlationId: ticket.ticketCode,
+      userId: String(user._id),
+      userName: user.name,
+      status: ticket.status,
+      priority: ticket.priority
+    });
+
+    return res.status(isNew ? 201 : 200).json({
+      ok: true,
+      ticketId: ticket.publicId || ticket.ticketCode,
+      supportTicketId: String(ticket._id),
+      status: ticket.status,
+      idempotent: Boolean(duplicate),
+      botReply: bot?.enabled ? bot.reply : "",
+      botIntent: bot?.enabled ? bot.intent : "",
+      typingDelayMs: bot?.enabled ? bot.typingDelayMs : 0
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function getSupportTicket(req, res, next) {
+  try {
+    const ticketCode = String(req.params.ticketId || "").trim();
+    const user = await User.findOne({ firebaseUid: req.auth.uid }).select("_id");
+    if (!user) return res.status(404).json({ message: "Customer profile not found" });
+
+    const ticket = await SupportTicket.findOne({
+      userId: user._id,
+      $or: [{ ticketCode }, { publicId: ticketCode.toUpperCase() }]
+    });
+    if (!ticket) return res.status(404).json({ message: "Support ticket not found" });
+
+    const now = new Date();
+    ticket.userUnreadCount = 0;
+    ticket.userLastReadAt = now;
+    await ticket.save();
+
+    return res.json({
+      ticketId: ticket.publicId || ticket.ticketCode,
+      status: ticket.status,
+      assignedTo: ticket.assignedTo || "",
+      bookingCode: ticket.bookingCode || "",
+      messages: (ticket.conversation || []).map((entry) => ({
+        id: String(entry._id),
+        bookingId: "support",
+        bookingCode: ticket.bookingCode || "",
+        senderRole: entry.senderRole === "admin" ? "support" : entry.senderRole,
+        senderName: entry.senderRole === "admin"
+          ? "ApnaServo Support"
+          : (entry.senderName || (entry.senderRole === "user" ? "You" : "ApnaServo Support")),
+        message: entry.message || "",
+        clientMessageId: entry.clientMessageId || "",
+        deliveryStatus: ["admin", "support"].includes(entry.senderRole) ? "read" : "sent",
+        createdAtMillis: new Date(entry.createdAt || ticket.createdAt).getTime()
+      }))
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function recordUserActivity(req, res, next) {
+  try {
+    const body = userActivitySchema.parse(req.body || {});
+    const user = await User.findOne({ firebaseUid: req.auth.uid }).select("_id name phone");
+    if (!user) return res.status(404).json({ message: "Customer profile not found" });
+    if (body.event === "service_clicked" && !body.serviceId && !body.serviceName) {
+      return res.status(400).json({ message: "Service is required for a service click" });
+    }
+
+    const recorded = await emitAdminEvent(`user:${body.event}`, {
+      userId: String(user._id),
+      userName: user.name || "Customer",
+      phone: user.phone || "",
+      actorRole: "user",
+      actorName: user.name || "Customer",
+      source: `${body.platform}_user_app`,
+      platform: body.platform,
+      screen: body.screen,
+      serviceId: body.serviceId,
+      serviceName: body.serviceName,
+      serviceCategory: body.category
+    });
+    if (!recorded) return res.status(503).json({ message: "Activity tracking is temporarily unavailable. Please retry." });
+    return res.status(202).json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function getLatestSupportTicket(req, res, next) {
+  try {
+    const user = await User.findOne({ firebaseUid: req.auth.uid }).select("_id");
+    if (!user) return res.status(404).json({ message: "Customer profile not found" });
+
+    const ticket = await SupportTicket.findOne({ userId: user._id })
+      .sort({ lastUpdatedAt: -1, createdAt: -1 });
+    if (!ticket) return res.json({ ticket: null });
+
+    const now = new Date();
+    ticket.userUnreadCount = 0;
+    ticket.userLastReadAt = now;
+    await ticket.save();
+
+    return res.json({
+      ticket: {
+        ticketId: ticket.publicId || ticket.ticketCode,
+        status: ticket.status,
+        assignedTo: ticket.assignedTo || "",
+        bookingCode: ticket.bookingCode || "",
+        messages: (ticket.conversation || []).map((entry) => ({
+          id: String(entry._id),
+          bookingId: "support",
+          bookingCode: ticket.bookingCode || "",
+          senderRole: entry.senderRole === "admin" ? "support" : entry.senderRole,
+          senderName: entry.senderRole === "admin"
+            ? "ApnaServo Support"
+            : (entry.senderName || (entry.senderRole === "user" ? "You" : "ApnaServo Support")),
+          message: entry.message || "",
+          clientMessageId: entry.clientMessageId || "",
+          deliveryStatus: ["admin", "support"].includes(entry.senderRole) ? "read" : "sent",
+          createdAtMillis: new Date(entry.createdAt || ticket.createdAt).getTime()
+        }))
+      }
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function requestDeletion(req, res, next) {
+  try {
+    const body = deletionRequestSchema.parse(req.body || {});
+    const user = await User.findOneAndUpdate(
+      { firebaseUid: req.auth.uid },
+      {
+        $set: {
+          accountStatus: "deletion_requested",
+           deletionRequestedAt: new Date(),
+           deletionReason: body.reason || "Customer requested account deletion from Android app",
+           fcmToken: "",
+           deviceTokens: []
+         },
+        $setOnInsert: {
+          firebaseUid: req.auth.uid,
+          name: firstRealCustomerName(req.auth.name) || "ApnaServo Customer",
+          phone: req.auth.phone_number || "",
+          email: req.auth.email || "",
+          city: "Guwahati"
+        }
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    return res.json({
+      ok: true,
+      accountStatus: user.accountStatus,
+      deletionRequestedAt: user.deletionRequestedAt
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function deleteAccount(req, res, next) {
+  try {
+    const user = await User.findOne({ firebaseUid: req.auth.uid });
+    if (!user) {
+      try {
+        initFirebase();
+        await admin.auth().deleteUser(req.auth.uid);
+      } catch (error) {
+        if (error?.code !== "auth/user-not-found") throw error;
+      }
+      return res.json({ ok: true, deleted: true, idempotent: true });
+    }
+
+    const userId = user._id;
+    const deletedLabel = `Deleted customer ${String(userId).slice(-6)}`;
+    await Booking.updateMany(
+      { userId },
+      {
+        $set: {
+          address: "Deleted account",
+          location: { type: "Point", coordinates: [0, 0] },
+          "contact.primaryPhone": "",
+          "contact.alternatePhone": "",
+          "userSnapshot.name": deletedLabel,
+          "userSnapshot.phone": "",
+          "userSnapshot.email": "",
+          "userSnapshot.fcmToken": ""
+        }
+      }
+    );
+
+    const collectionsToDelete = [
+      "bookingmessages", "inappnotifications", "supporttickets", "calllogs",
+      "customernoresponsereports", "jobproofphotos", "reviews", "reviewdisputes",
+      "revisitrequests", "smsdeliverylogs", "techniciansos", "fraudalerts"
+    ];
+    await Promise.all(collectionsToDelete.map(async (collectionName) => {
+      const collection = User.db.collection(collectionName);
+      await collection.deleteMany({ userId });
+    }));
+
+    initFirebase();
+    try {
+      await admin.auth().deleteUser(req.auth.uid);
+    } catch (error) {
+      if (error?.code !== "auth/user-not-found") throw error;
+    }
+    await User.deleteOne({ _id: userId });
+    emitAdminEvent("user:deleted", { userId: String(userId), deletedAt: new Date() });
+    return res.json({ ok: true, deleted: true });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+module.exports = {
+  upsertProfile,
+  me,
+  saveFcmToken,
+  recordUserActivity,
+  syncSupportTicket,
+  getLatestSupportTicket,
+  getSupportTicket,
+  requestDeletion,
+  deleteAccount
+};

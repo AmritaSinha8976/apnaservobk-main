@@ -1,0 +1,3206 @@
+const mongoose = require("mongoose");
+const crypto = require("crypto");
+const { z } = require("zod");
+const User = require("../models/User");
+const Service = require("../models/Service");
+const Partner = require("../models/Partner");
+const { Booking, BOOKING_STATUSES } = require("../models/Booking");
+const CallLog = require("../models/CallLog");
+const LocationLog = require("../models/LocationLog");
+const CommissionLedger = require("../models/CommissionLedger");
+const CustomerNoResponseReport = require("../models/CustomerNoResponseReport");
+const TechnicianSos = require("../models/TechnicianSos");
+const JobProofPhoto = require("../models/JobProofPhoto");
+const RevisitRequest = require("../models/RevisitRequest");
+const Payment = require("../models/Payment");
+const { ensurePaidInvoice } = require("../services/invoiceService");
+const { cloudinary } = require("../config/cloudinary");
+const { normalizeServiceCategory, serviceCategoryVariants, serviceLabel, companySingleServiceCategory, partnerCanServeService } = require("../utils/serviceCategory");
+const { validatePartnerLocation, partnerLocationUpdate } = require("../utils/locationValidation");
+const { recordFraudSignal } = require("../utils/fraudDetection");
+const {
+  dispatchableBookingStatuses,
+  normalizeBookingStatusInput,
+  pendingAssignmentStatuses,
+  transitionDecision
+} = require("../utils/bookingLifecycle");
+const findNearbyPartners = require("../utils/findNearbyPartners");
+const { reliableNotify } = require("../utils/reliableNotify");
+const { bestDiscountForBooking } = require("../utils/bookingDiscount");
+const { activeDeviceTokens } = require("../utils/notificationTokens");
+const { validateServiceArea } = require("../utils/serviceArea");
+const { creditReferralJobOnce } = require("./referralController");
+const { expireDuePartnerRequests, partnerRequestExpiresAt } = require("../utils/bookingRequestExpiry");
+const { getPublishedConfig, isScheduleActive, bookingAvailability } = require("../utils/appControl");
+const { getBookingLaunchConfig, ensureLaunchNotificationSchedule } = require("../utils/bookingLaunchConfig");
+const { getChecklist } = require("../utils/serviceChecklist");
+const { isPlaceholderCustomerName, firstRealCustomerName } = require("../utils/customerIdentity");
+const billingService = require("../services/billingService");
+const cache = require("../config/cache");
+const {
+  addPartnerRequests,
+  markRequestResponse,
+  markRequestViewed,
+  recordNotificationResult
+} = require("../utils/partnerRequestTracking");
+const {
+  emitNewBookingToPartners,
+  emitBookingAccepted,
+  emitBookingRejected,
+  emitBookingStatusUpdate,
+  emitAdminEvent,
+  serializeBooking
+} = require("../sockets/bookingSocket");
+
+const createBookingSchema = z.object({
+  bookingId: z.string().trim().toUpperCase().regex(/^ASB-\d{8}-[A-Z0-9]{8}$/).optional(),
+  bookingCode: z.string().trim().regex(/^[A-Za-z0-9_-]{6,64}$/).optional(),
+  serviceCategory: z.string().trim().min(1).max(80).optional(),
+  serviceName: z.string().trim().max(120).optional(),
+  issue: z.string().trim().max(500).optional(),
+  address: z.string().trim().min(3).max(700),
+  city: z.string().trim().max(80).optional(),
+  lat: z.coerce.number().min(-90).max(90).refine((value) => value !== 0, "Valid service latitude is required"),
+  lng: z.coerce.number().min(-180).max(180).refine((value) => value !== 0, "Valid service longitude is required"),
+  price: z.coerce.number().min(0).max(1000000).optional(),
+  userName: z.string().trim().max(120).optional(),
+  name: z.string().trim().max(120).optional(),
+  fullName: z.string().trim().max(120).optional(),
+  userPhone: z.string().trim().max(20).optional(),
+  primaryPhone: z.string().trim().max(20).optional(),
+  alternatePhone: z.string().trim().max(20).optional(),
+  houseFlat: z.string().trim().max(120).optional(),
+  building: z.string().trim().max(180).optional(),
+  floor: z.string().trim().max(80).optional(),
+  room: z.string().trim().max(80).optional(),
+  landmark: z.string().trim().max(180).optional(),
+  phoneVerified: z.boolean().optional(),
+  emergency: z.boolean().optional(),
+  emergencyType: z.enum(["electric_short_circuit", "water_leakage", "ac_breakdown", "other"]).optional(),
+  emergencyPriority: z.enum(["normal", "urgent", "critical"]).optional(),
+  emergencyNotes: z.string().trim().max(500).optional(),
+  formAnswers: z.record(z.string().max(500)).optional().default({}),
+  formConfigVersion: z.union([z.string().max(40), z.number()]).optional(),
+  commercial: z.boolean().optional().default(false),
+  requestedPartnerId: z.string().trim().max(100).optional(),
+  // ── Scheduling fields ──────────────────────────────────────────────────────
+  // bookingType: "instant" (default, within ~2 hrs) or "scheduled" (chosen slot)
+  bookingType: z.enum(["instant", "scheduled"]).optional().default("instant"),
+  // scheduledDate: "YYYY-MM-DD" in IST — required when bookingType = "scheduled"
+  scheduledDate: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/).optional().or(z.literal("")),
+  // scheduledSlot: half-day window the customer chose. "" is accepted for
+  // instant bookings (clients send an empty string rather than omitting it).
+  scheduledSlot: z.enum(["morning", "afternoon", "evening"]).optional().or(z.literal(""))
+});
+
+function validatedFormAnswers(config, category, submitted) {
+  const schema = config?.forms?.[category];
+  const fields = Array.isArray(schema?.fields) ? schema.fields : [];
+  if (!fields.length) return {};
+  const answers = submitted && typeof submitted === "object" ? submitted : {};
+  const output = {};
+  for (const field of fields) {
+    if (!field?.id || field.visible === false) continue;
+    const value = String(answers[field.id] ?? "").trim();
+    if (field.required && !value) {
+      const error = new Error(`${field.label || field.id} is required`); error.status = 400; error.code = "FORM_FIELD_REQUIRED"; throw error;
+    }
+    if (!value) continue;
+    const validation = field.validation || {};
+    if (value.length < Number(validation.minLength || 0) || value.length > Number(validation.maxLength || 1000)) {
+      const error = new Error(`${field.label || field.id} is invalid`); error.status = 400; error.code = "FORM_FIELD_INVALID"; throw error;
+    }
+    if (["singleSelect", "radio"].includes(field.type) && Array.isArray(field.options) && field.options.length && !field.options.includes(value)) {
+      const error = new Error(`${field.label || field.id} must use a published option`); error.status = 400; error.code = "FORM_OPTION_INVALID"; throw error;
+    }
+    output[field.id] = value;
+  }
+  return output;
+}
+
+const callActionSchema = z.object({
+  action: z.enum(["start", "report"]),
+  reason: z.string().optional(),
+  contactType: z.enum(["primary", "alternate"]).optional()
+});
+
+const bookingContactSchema = z.object({
+  primaryPhone: z.string().trim().max(20),
+  alternatePhone: z.string().trim().max(20).optional().default("")
+});
+
+const bookingLocationSchema = z.object({
+  address: z.string().trim().min(10).max(700),
+  city: z.string().trim().max(80).optional(),
+  lat: z.coerce.number().min(-90).max(90),
+  lng: z.coerce.number().min(-180).max(180),
+  expectedVersion: z.coerce.number().int().min(1).optional(),
+  houseFlat: z.string().trim().max(120).optional(),
+  building: z.string().trim().max(180).optional(),
+  floor: z.string().trim().max(80).optional(),
+  room: z.string().trim().max(80).optional(),
+  landmark: z.string().trim().max(180).optional()
+});
+
+function effectiveBookingLaunchStatus(publishedControl) {
+  const config = publishedControl?.config || {};
+  const version = Number(publishedControl?.version || 0);
+  const hasPublishedControl = version > 0;
+  const bookingOpen = hasPublishedControl
+    ? ["LIVE", "PARTIALLY_AVAILABLE"].includes(config.appStatus?.mode)
+      && config.launch?.enabled !== true
+    : String(process.env.BOOKING_OPEN || "false").trim().toLowerCase() === "true";
+  const launchDateLabel = hasPublishedControl
+    ? (config.launch?.dateText || config.launch?.title || "ApnaServo launch")
+    : String(process.env.BOOKING_LAUNCH_DATE_LABEL || "20th August").trim();
+  return { bookingOpen, launchDateLabel, controlVersion: version };
+}
+
+const locationResponseSchema = z.object({
+  action: z.enum(["accept", "reject"]),
+  reason: z.string().trim().max(500).optional()
+});
+
+const quoteCounterSchema = z.object({
+  amount: z.coerce.number().positive(),
+  message: z.string().max(250).optional()
+});
+
+const rejectBookingSchema = z.object({
+  reason: z.string().trim().max(240).optional().default("")
+});
+
+const chatMonitorSchema = z.object({
+  message: z.string().min(1).max(1000),
+  clientMessageId: z.string().max(120).optional(),
+  source: z.string().max(40).optional()
+});
+
+const noResponseReportSchema = z.object({
+  reason: z.string().min(3).max(500),
+  evidenceUrl: z.string().optional(),
+  lat: z.coerce.number(),
+  lng: z.coerce.number(),
+  accuracy: z.coerce.number().optional(),
+  provider: z.string().optional(),
+  isMock: z.boolean().optional(),
+  recordedAt: z.coerce.number().optional()
+});
+
+const LEGACY_FALLBACK_LAT = 26.1445;
+const LEGACY_FALLBACK_LNG = 91.7362;
+
+function normalizedLocationAddress(value) {
+  return String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function pointCoordinates(location) {
+  const coordinates = location?.coordinates;
+  const lng = Number(coordinates?.[0]);
+  const lat = Number(coordinates?.[1]);
+  return findNearbyPartners.validCoordinates(lat, lng) ? { lat, lng } : null;
+}
+
+function isLegacyFallbackLocation(lat, lng) {
+  return Math.abs(Number(lat) - LEGACY_FALLBACK_LAT) < 0.0002
+    && Math.abs(Number(lng) - LEGACY_FALLBACK_LNG) < 0.0002;
+}
+
+function trustedSavedCoordinates(user, address) {
+  const normalized = normalizedLocationAddress(address);
+  if (!user || !normalized) return null;
+  const saved = (user.savedAddresses || []).find(
+    (entry) => normalizedLocationAddress(entry.address) === normalized
+      && pointCoordinates(entry.location)
+      && !isLegacyFallbackLocation(pointCoordinates(entry.location).lat, pointCoordinates(entry.location).lng)
+  );
+  if (saved) return pointCoordinates(saved.location);
+  const profilePoint = pointCoordinates(user.location);
+  if (normalizedLocationAddress(user.address) === normalized
+      && profilePoint
+      && !isLegacyFallbackLocation(profilePoint.lat, profilePoint.lng)) {
+    return profilePoint;
+  }
+  return null;
+}
+
+async function recoverLegacyFallbackCoordinates(firebaseUid, body) {
+  if (!isLegacyFallbackLocation(body.lat, body.lng)) return { recovered: false };
+  const user = await User.findOne({ firebaseUid }).select("address location savedAddresses");
+  const trusted = trustedSavedCoordinates(user, body.address);
+  if (!trusted) return { recovered: false, unresolvedFallback: true };
+  body.lat = trusted.lat;
+  body.lng = trusted.lng;
+  return { recovered: true };
+}
+
+async function repairLegacyFallbackBookingLocations(bookings) {
+  const affected = (bookings || []).filter((booking) => {
+    const point = pointCoordinates(booking.location);
+    return point && isLegacyFallbackLocation(point.lat, point.lng) && booking.userId;
+  });
+  if (!affected.length) return;
+  const users = await User.find({ _id: { $in: affected.map((booking) => booking.userId) } })
+    .select("address location savedAddresses");
+  const usersById = new Map(users.map((user) => [String(user._id), user]));
+  for (const booking of affected) {
+    const trusted = trustedSavedCoordinates(usersById.get(String(booking.userId)), booking.address);
+    if (!trusted) continue;
+    booking.location = { type: "Point", coordinates: [trusted.lng, trusted.lat] };
+    booking.locationUpdatedAt = new Date();
+    booking.locationUpdatedBy = "system";
+    setImmediate(() => Booking.updateOne(
+      { _id: booking._id, "location.coordinates.0": { $gte: LEGACY_FALLBACK_LNG - 0.0002, $lte: LEGACY_FALLBACK_LNG + 0.0002 }, "location.coordinates.1": { $gte: LEGACY_FALLBACK_LAT - 0.0002, $lte: LEGACY_FALLBACK_LAT + 0.0002 } },
+      { $set: { location: booking.location, locationUpdatedAt: booking.locationUpdatedAt, locationUpdatedBy: "system" }, $inc: { locationVersion: 1 } }
+    ).catch((error) => console.warn("legacy_booking_location_repair_failed", { bookingId: String(booking._id), message: error.message })));
+  }
+}
+
+const sosSchema = z.object({
+  reason: z.enum(["emergency", "unsafe_location", "customer_issue", "accident", "other"]).optional(),
+  note: z.string().max(500).optional(),
+  lat: z.coerce.number().optional(),
+  lng: z.coerce.number().optional(),
+  accuracy: z.coerce.number().optional()
+});
+
+const proofPhotoSchema = z.object({
+  stage: z.enum(["before", "after"]),
+  note: z.string().max(500).optional(),
+  lat: z.coerce.number().optional(),
+  lng: z.coerce.number().optional(),
+  accuracy: z.coerce.number().optional()
+});
+
+const revisitRequestSchema = z.object({
+  reason: z.string().max(80).optional(),
+  message: z.string().max(600).optional()
+});
+
+const acceptBookingSchema = z.object({
+  arrivalEstimateMinutes: z.coerce.number().int().min(10).max(1440).default(30),
+  arrivalEstimateLabel: z.string().trim().max(80).optional()
+});
+
+const QUOTE_EXPIRY_MS = 24 * 60 * 60 * 1000;
+const PARTNER_STATUS_UPDATES = ["on_the_way", "arrived", "started", "amount_pending", "completed", "cancelled"];
+// A customer may submit a direct-payment claim through /payment-submitted,
+// but only the assigned partner (or a verified gateway callback) can mark it paid.
+const CUSTOMER_STATUS_UPDATES = ["cancelled", "disputed"];
+
+function normalizeStaffPhone(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  const phone = digits.length > 10 ? digits.slice(-10) : digits;
+  return /^[6-9]\d{9}$/.test(phone) ? phone : "";
+}
+
+function normalizeCustomerPhone(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  const phone = digits.length > 10 ? digits.slice(-10) : digits;
+  return /^[6-9]\d{9}$/.test(phone) ? phone : "";
+}
+
+function normalizeStaffEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function staffIdentityHash(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return "";
+  const secret = process.env.IDENTITY_HASH_PEPPER || process.env.ENCRYPTION_KEY || "apnaservo-dev-identity-hash";
+  return crypto.createHmac("sha256", secret).update(normalized).digest("hex");
+}
+
+async function findLaundryStaffActor(auth) {
+  const phone = normalizeStaffPhone(auth?.phone_number || "");
+  const email = auth?.email_verified === true ? normalizeStaffEmail(auth?.email || "") : "";
+  const phoneHash = staffIdentityHash(phone);
+  const emailHash = staffIdentityHash(email);
+  if ((!phone && !email) || auth?.development_device) return null;
+
+  let partner = await Partner.findOne({
+    businessType: "laundry",
+    $or: [
+      { "laundryBusiness.staffMembers.firebaseUid": auth.uid },
+      ...(phoneHash ? [{ "laundryBusiness.staffMembers.phoneHash": phoneHash }] : []),
+      ...(emailHash ? [{ "laundryBusiness.staffMembers.emailHash": emailHash }] : [])
+    ]
+  });
+  // Legacy staff invitations may predate identity hashes. The fallback still
+  // requires an exact Firebase-verified phone/email match; it only lets those
+  // existing staff members transition safely to the current auth scheme.
+  if (!partner) {
+    const candidates = await Partner.find({ businessType: "laundry" }).limit(500);
+    partner = candidates.find((candidate) => (candidate.laundryBusiness?.staffMembers || [])
+      .some((member) => (phone && normalizeStaffPhone(member.phone) === phone)
+        || (email && normalizeStaffEmail(member.email) === email)));
+  }
+  if (!partner) return null;
+  const staff = (partner.laundryBusiness?.staffMembers || []).find((member) =>
+    member.firebaseUid === auth.uid
+      || (phoneHash && member.phoneHash === phoneHash)
+      || (emailHash && member.emailHash === emailHash)
+      || (phone && normalizeStaffPhone(member.phone) === phone)
+      || (email && normalizeStaffEmail(member.email) === email)
+  );
+  if (!staff || ["blocked", "rejected"].includes(staff.verificationStatus)) return null;
+  return { partner, staff };
+}
+function hasStatusLocationPayload(body = {}) {
+  return Number.isFinite(Number(body.lat)) && Number.isFinite(Number(body.lng));
+}
+
+function bookingCode() {
+  return `AS${Date.now().toString(36).toUpperCase()}${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
+}
+
+function serviceCategoryForEmergency(type) {
+  if (type === "electric_short_circuit") return "electrician";
+  if (type === "water_leakage") return "plumbing";
+  if (type === "ac_breakdown") return "ac";
+  return "service";
+}
+
+function fileDataUri(file) {
+  return `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
+}
+
+async function uploadProofToCloudinary(file, bookingId, stage) {
+  if (!process.env.CLOUDINARY_CLOUD_NAME) {
+    return { storageProvider: "inline", url: "", cloudinaryPublicId: "" };
+  }
+  const result = await cloudinary.uploader.upload(fileDataUri(file), {
+    folder: `apnaservo/job_proofs/${bookingId}`,
+    public_id: `${stage}_${Date.now()}`,
+    resource_type: "image",
+    overwrite: false,
+    quality: "auto:good",
+    fetch_format: "auto"
+  });
+  return {
+    storageProvider: "cloudinary",
+    url: result.secure_url || result.url || "",
+    cloudinaryPublicId: result.public_id || ""
+  };
+}
+
+function warrantyDaysFor(booking) {
+  const configured = Number(process.env.SERVICE_WARRANTY_DAYS || 7);
+  if (Number.isFinite(configured) && configured >= 0 && configured <= 365) {
+    return Math.floor(configured);
+  }
+  return booking?.emergency?.isEmergency ? 3 : 7;
+}
+
+function warrantyEndDateFrom(serviceDate, days) {
+  return new Date(serviceDate.getTime() + days * 24 * 60 * 60 * 1000);
+}
+
+function serializeTracking({ booking, partner, latestLocation, recentLocations }) {
+  const partnerLocation = partner?.location?.coordinates || [0, 0];
+  return {
+    bookingId: String(booking._id),
+    bookingCode: booking.bookingCode,
+    status: booking.status,
+    partnerId: booking.partnerId ? String(booking.partnerId) : "",
+    partnerName: booking.partnerSnapshot?.name || partner?.name || "",
+    partnerPhoneMasked: maskPhone(booking.partnerSnapshot?.phone || partner?.phone || ""),
+    lat: latestLocation?.lat || partnerLocation[1] || 0,
+    lng: latestLocation?.lng || partnerLocation[0] || 0,
+    accuracy: latestLocation?.accuracy || partner?.lastLocationAccuracy || 9999,
+    provider: latestLocation?.provider || partner?.lastLocationProvider || "",
+    updatedAt: latestLocation?.recordedAt || partner?.lastLocationAt || null,
+    updatedAtMillis: latestLocation?.recordedAt ? new Date(latestLocation.recordedAt).getTime() : millis(partner?.lastLocationAt),
+    trustStatus: partner?.locationTrustStatus || "unknown",
+    recent: (recentLocations || []).map((entry) => ({
+      lat: entry.lat,
+      lng: entry.lng,
+      accuracy: entry.accuracy,
+      provider: entry.provider,
+      recordedAt: entry.recordedAt,
+      recordedAtMillis: millis(entry.recordedAt)
+    }))
+  };
+}
+
+function serializeProofPhoto(photo) {
+  return {
+    id: String(photo._id),
+    bookingId: String(photo.bookingId),
+    bookingCode: photo.bookingCode,
+    stage: photo.stage,
+    url: photo.url || "",
+    storageProvider: photo.storageProvider,
+    note: photo.note || "",
+    lat: photo.lat,
+    lng: photo.lng,
+    createdAt: photo.createdAt ? photo.createdAt.toISOString() : ""
+  };
+}
+
+function serializeRevisitRequest(request) {
+  return {
+    id: String(request._id),
+    bookingId: String(request.bookingId),
+    bookingCode: request.bookingCode,
+    reason: request.reason,
+    message: request.message || "",
+    status: request.status,
+    warrantyEndDate: request.warrantyEndDate ? request.warrantyEndDate.toISOString() : "",
+    requestedAt: request.requestedAt ? request.requestedAt.toISOString() : ""
+  };
+}
+
+function maskPhone(phone) {
+  const digits = String(phone || "").replace(/\D/g, "");
+  if (digits.length < 4) return "Protected";
+  const last = digits.slice(-4);
+  const prefix = digits.length > 10 ? `+${digits.slice(0, digits.length - 10)} ` : "";
+  return `${prefix}******${last}`;
+}
+
+function normalizePhone(value) {
+  return String(value || "").replace(/\D/g, "").slice(-10);
+}
+
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function identityHash(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return "";
+  const secret = process.env.IDENTITY_HASH_PEPPER || process.env.ENCRYPTION_KEY || "apnaservo-dev-identity-hash";
+  return crypto.createHmac("sha256", secret).update(normalized).digest("hex");
+}
+
+function firebasePhoneVerified(req, phone) {
+  const tokenPhone = normalizePhone(req.auth?.phone_number);
+  const customerPhone = normalizePhone(phone);
+  return tokenPhone.length === 10 && customerPhone.length === 10 && tokenPhone === customerPhone;
+}
+
+function requireCustomerOtp() {
+  return String(process.env.REQUIRE_CUSTOMER_PHONE_OTP || "").toLowerCase() === "true";
+}
+
+function virtualCallNumber() {
+  return String(process.env.VIRTUAL_CALL_NUMBER || process.env.APNA_SERVO_VIRTUAL_CALL_NUMBER || "").trim();
+}
+
+function bookingIdFilter(bookingId) {
+  const publicId = String(bookingId || "").trim().toUpperCase();
+  return mongoose.Types.ObjectId.isValid(bookingId)
+    ? { $or: [{ _id: new mongoose.Types.ObjectId(bookingId) }, { bookingId: publicId }, { bookingCode: bookingId }, { publicId }] }
+    : { $or: [{ bookingId: publicId }, { bookingCode: bookingId }, { publicId }] };
+}
+
+function quoteExpiresAtFrom(now = new Date()) {
+  return new Date(now.getTime() + QUOTE_EXPIRY_MS);
+}
+
+function isQuoteExpired(booking, now = new Date()) {
+  if (!booking || booking.quoteStatus !== "pending" || !booking.quoteExpiresAt) {
+    return false;
+  }
+  return new Date(booking.quoteExpiresAt).getTime() <= now.getTime();
+}
+
+function approvalQuoteStatus(booking) {
+  if (!booking) return "none";
+  if (booking.quoteStatus && booking.quoteStatus !== "none") {
+    return booking.quoteStatus;
+  }
+  return booking.status === "amount_pending" ? "pending" : "none";
+}
+
+async function expireQuoteIfNeeded(booking, options = {}) {
+  if (!isQuoteExpired(booking)) {
+    return false;
+  }
+  booking.quoteStatus = "expired";
+  booking.status = "started";
+  booking.paymentStatus = "pending";
+  booking.statusTimeline = Array.isArray(booking.statusTimeline) ? booking.statusTimeline : [];
+  booking.quoteHistory = Array.isArray(booking.quoteHistory) ? booking.quoteHistory : [];
+  booking.statusTimeline.push({ status: "quote_expired", at: new Date(), by: "system" });
+  booking.quoteHistory.push({
+    kind: "quote_expired",
+    amount: Number(booking.quoteAmount || booking.finalAmount || 0),
+    by: "system",
+    message: "Quote expired after 24 hours",
+    at: new Date()
+  });
+  if (typeof booking.save === "function") {
+    await booking.save();
+  }
+  if (options.emit) {
+    emitBookingStatusUpdate(booking);
+    emitAdminEvent("booking:quote_expired", serializeBooking(booking));
+  }
+  return true;
+}
+
+async function expireQuotesIfNeeded(bookings) {
+  for (const booking of bookings) {
+    await expireQuoteIfNeeded(booking);
+  }
+  return bookings;
+}
+
+function commissionRate() {
+  const value = Number(process.env.APP_COMMISSION_RATE || 0.1);
+  return Number.isFinite(value) && value >= 0 && value <= 1 ? value : 0.1;
+}
+
+// Resolves the commission rate for a completed booking based on the partner's
+// billing model:
+//   • cleaning (commission model) → cleaning_commission_rate (0.25), or 0%
+//     while the partner is still inside the free trial window.
+//   • everyone else (subscription model) → 0% commission. These partners are
+//     monetized through the flat monthly subscription, not per-booking
+//     commission, so no platform cut is taken on their jobs.
+// A ledger row is still written at the resolved rate (0 for subscription
+// partners) so every completed booking has a consistent accounting record.
+async function resolveCommissionRate(booking) {
+  try {
+    const partner = await Partner.findById(booking.partnerId)
+      .select("serviceCategory billingModel trialEndsAt subscriptionExpiresAt subscriptionStatus")
+      .lean();
+    if (!partner) return commissionRate();
+    return billingService.commissionRateForPartner(partner, booking.completedAt || new Date());
+  } catch (error) {
+    console.warn("[billing] commission rate resolve failed", {
+      bookingId: String(booking?._id || ""),
+      message: error?.message
+    });
+    return commissionRate();
+  }
+}
+
+async function upsertCommissionLedger(booking) {
+  if (!booking?.partnerId || !booking?.userId) {
+    return null;
+  }
+  const grossAmount = Math.round(Number(booking.finalAmount || booking.price || 0));
+  const rate = await resolveCommissionRate(booking);
+  const commissionAmount = Math.round(grossAmount * rate);
+  const netPayable = Math.max(0, grossAmount - commissionAmount);
+  return CommissionLedger.findOneAndUpdate(
+    { bookingId: booking._id },
+    {
+      $set: {
+        bookingCode: booking.bookingCode,
+        partnerId: booking.partnerId,
+        userId: booking.userId,
+        grossAmount,
+        commissionRate: rate,
+        commissionAmount,
+        netPayable,
+        status: "pending",
+        source: "booking_completion",
+        completedAt: booking.completedAt || new Date()
+      }
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+}
+
+async function creditCompletedBookingOnce(booking) {
+  if (!booking?.partnerId || !booking?.userId || booking.status !== "completed") {
+    return false;
+  }
+  const grossAmount = Math.round(Number(booking.finalAmount || booking.price || 0));
+  const creditedBooking = await Booking.findOneAndUpdate(
+    { _id: booking._id, "completionAccounting.creditedAt": null },
+    {
+      $set: {
+        "completionAccounting.creditedAt": new Date(),
+        "completionAccounting.grossAmount": grossAmount
+      }
+    },
+    { new: true }
+  );
+  if (!creditedBooking) {
+    return false;
+  }
+  await Partner.findByIdAndUpdate(booking.partnerId, {
+    $inc: { totalJobs: 1, earnings: grossAmount }
+  });
+  await upsertCommissionLedger(creditedBooking);
+  return true;
+}
+
+function protectCustomerPhoneForPartner(payload, booking, partner) {
+  const assigned = partner && String(booking.partnerId || "") === String(partner._id);
+  const customerPhone = assigned ? String(booking.userSnapshot?.phone || payload.userPhone || "") : "";
+  return {
+    ...payload,
+    userPhone: customerPhone || maskPhone(booking.userSnapshot?.phone || payload.userPhone),
+    customerPhone: customerPhone,
+    customerPhoneMasked: customerPhone || maskPhone(booking.userSnapshot?.phone || payload.userPhone),
+    phoneProtected: !assigned,
+    virtualCalling: Boolean(virtualCallNumber())
+  };
+}
+
+function partnerCategoryVariants(partner) {
+  const categories = [...new Set((partner.serviceCategory || [])
+    .map(normalizeServiceCategory)
+    .filter((category) => category && category !== "service"))];
+  // A company profile is a single operating service. An ambiguous legacy
+  // record receives no new work until its category is normalized, rather than
+  // falling back to Laundry or whichever value happens to come first.
+  if (partner?.businessType === "laundry") {
+    const selected = companySingleServiceCategory(partner);
+    return selected ? serviceCategoryVariants(selected) : [];
+  }
+  return [...new Set(categories.flatMap(serviceCategoryVariants))];
+}
+
+function partnerOpenBookingVisibility(partner, categories) {
+  return {
+    partnerId: null,
+    rejectedPartners: { $ne: partner._id },
+    status: { $in: pendingAssignmentStatuses() },
+    serviceCategory: { $in: categories },
+    requestedPartners: partner._id,
+    requestExpiresAt: { $gt: new Date() }
+  };
+}
+
+
+function partnerAcceptBlockReason(partner) {
+  if (!partner) return "Partner profile not found";
+  if (partner.accountStatus !== "active") return "Partner account is not active";
+  if (partner.trustStatus === "suspended") return "Partner account is suspended";
+  if (!partner.isVerified || partner.kycStatus !== "verified" || partner.trustStatus !== "trusted") {
+    return "ApnaServo admin approval is pending. Keep your device online after approval to receive bookings.";
+  }
+  if (!partner.isOnline) return "Go online before accepting new jobs";
+  if (!partner.phone) return "Add a phone number before accepting jobs";
+  if (!Array.isArray(partner.serviceCategory) || partner.serviceCategory.length === 0) {
+    return "Select at least one service before accepting jobs";
+  }
+  return "";
+}
+
+function partnerCanViewOpenJobs(partner) {
+  if (!partner) return false;
+  if (partner.accountStatus !== "active") return false;
+  if (partner.trustStatus === "suspended") return false;
+  if (!partner.isVerified || partner.kycStatus !== "verified" || partner.trustStatus !== "trusted") return false;
+  if (!partner.isOnline) return false;
+  return Array.isArray(partner.serviceCategory) && partner.serviceCategory.length > 0;
+}
+
+function userRecipient(user) {
+  if (!user) return null;
+  const tokens = activeDeviceTokens(user, "user").map((device) => device.token);
+  return {
+    role: "user",
+    userId: user._id,
+    firebaseUid: user.firebaseUid,
+    token: tokens[0] || user.fcmToken,
+    tokens,
+    phone: user.phone
+  };
+}
+
+function partnerRecipient(partner) {
+  if (!partner) return null;
+  const tokens = activeDeviceTokens(partner, "partner").map((device) => device.token);
+  return {
+    role: "partner",
+    partnerId: partner._id,
+    firebaseUid: partner.firebaseUid,
+    token: tokens[0] || partner.fcmToken,
+    tokens,
+    phone: partner.phone
+  };
+}
+
+function emergencyPayload(body) {
+  const type = body.emergencyType || "none";
+  const isEmergency = Boolean(body.emergency || type !== "none");
+  return {
+    isEmergency,
+    type: isEmergency ? type : "none",
+    priority: isEmergency ? (body.emergencyPriority || (type === "electric_short_circuit" ? "critical" : "urgent")) : "normal",
+    notes: body.emergencyNotes || "",
+    requestedAt: isEmergency ? new Date() : null
+  };
+}
+
+function partnerRequestEventPayload(booking, request) {
+  return {
+    bookingId: String(booking._id),
+    bookingCode: booking.bookingCode || "",
+    userId: String(booking.userId || ""),
+    partnerId: String(request.partnerId || ""),
+    partnerName: request.partnerSnapshot?.name || "Partner",
+    requestId: request.requestId || "",
+    status: request.status || "requested",
+    dispatchAttempt: Number(request.dispatchAttempt || 0),
+    dispatchStage: Number(request.dispatchStage || 0),
+    source: request.source || "automatic"
+  };
+}
+
+async function recordPartnerRequestDeliveryResults(bookingId, requests, results = []) {
+  const current = await Booking.findById(bookingId);
+  if (!current || !Array.isArray(requests) || requests.length === 0) return;
+  const changed = [];
+  for (let index = 0; index < requests.length; index += 1) {
+    const outcome = recordNotificationResult(current, requests[index].requestId, results[index] || {}, { at: new Date() });
+    if (outcome.changed && outcome.request) changed.push(outcome.request);
+  }
+  if (!changed.length) return;
+  await current.save();
+  for (const request of changed) {
+    const delivered = request.notification?.pushStatus === "sent";
+    emitAdminEvent(
+      delivered ? "booking:partner_request_delivered" : "booking:partner_request_failed",
+      partnerRequestEventPayload(current, request)
+    );
+  }
+}
+
+async function validateRequestedPartner(requestedPartnerId, category, lat, lng) {
+  if (!requestedPartnerId) return { partner: null, error: null };
+  const idStr = String(requestedPartnerId).trim();
+  const query = mongoose.isValidObjectId(idStr)
+    ? { $or: [{ _id: idStr }, { publicId: idStr }] }
+    : { publicId: idStr };
+  const partner = await Partner.findOne(query);
+  if (!partner) {
+    return { partner: null, error: { status: 404, code: "PARTNER_NOT_FOUND", message: "Requested partner not found" } };
+  }
+  if (partner.accountStatus !== "active" || partner.trustStatus === "suspended") {
+    return { partner: null, error: { status: 422, code: "PARTNER_NOT_ACTIVE", message: "Requested partner is not active" } };
+  }
+  if (!partner.isVerified || partner.kycStatus !== "verified" || partner.trustStatus !== "trusted") {
+    return { partner: null, error: { status: 422, code: "PARTNER_NOT_VERIFIED", message: "Requested partner is not yet approved" } };
+  }
+  if (!partner.isOnline) {
+    return { partner: null, error: { status: 422, code: "PARTNER_OFFLINE", message: "Requested partner is currently offline" } };
+  }
+  if (!partnerCanServeService(partner, category)) {
+    return { partner: null, error: { status: 422, code: "PARTNER_SERVICE_MISMATCH", message: "Requested partner does not offer this service" } };
+  }
+  const serviceArea = validateServiceArea(lat, lng);
+  if (!serviceArea.allowed) {
+    return { partner: null, error: { status: 422, code: "PARTNER_OUTSIDE_SERVICE_AREA", message: "Requested partner is outside the service area" } };
+  }
+  return { partner, error: null };
+}
+
+/**
+ * For a scheduled booking, keep only partners who declared availability for the
+ * booking's scheduled date + slot. Partners with no availability record for that
+ * date are excluded (they have not committed to that time).
+ *
+ * For instant bookings this is a no-op — all nearby partners are kept.
+ */
+function filterPartnersByAvailability(partners, booking) {
+  if (!booking || booking.bookingType !== "scheduled") return partners;
+  const date = String(booking.scheduledDate || "");
+  const slot = String(booking.scheduledSlot || "");
+  if (!date || !slot) return partners;
+  return (partners || []).filter((partner) => {
+    const entry = (partner.availability || []).find((a) => a.date === date);
+    return Boolean(entry && entry[slot] === true);
+  });
+}
+
+async function dispatchBookingToPartners(booking, category, lat, lng) {
+  let match = { partners: [], radiusKm: 0, mode: "" };
+  try {
+    match = await findNearbyPartners.withMetadata({
+      serviceCategory: category,
+      city: booking.city,
+      lat,
+      lng,
+      excludePartnerIds: booking.rejectedPartners || []
+    });
+  } catch (error) {
+    console.error("Partner matching failed", {
+      bookingId: String(booking._id),
+      bookingCode: booking.bookingCode,
+      message: error.message
+    });
+    await Booking.findByIdAndUpdate(booking._id, {
+      $push: {
+        statusTimeline: {
+          status: "partner_routing_failed",
+          at: new Date(),
+          by: "system",
+          note: "Eligible partner search failed before any request was sent"
+        }
+      }
+    });
+    emitAdminEvent("booking:partner_routing_failed", {
+      bookingId: String(booking._id),
+      bookingCode: booking.bookingCode,
+      userId: String(booking.userId || ""),
+      status: "failed",
+      failureReason: "Eligible partner search failed"
+    });
+    emitNewBookingToPartners(booking, []);
+    return match.partners;
+  }
+  // For scheduled bookings, narrow the matched partners down to those who have
+  // declared availability for the requested date + slot. Instant bookings keep
+  // the full nearby list unchanged.
+  const partners = filterPartnersByAvailability(match.partners, booking);
+
+  if (!partners.length) {
+    // No eligible partner. For scheduled bookings this commonly means nobody
+    // declared availability for the chosen slot yet — leave the booking in a
+    // dispatchable state so a partner who later declares that slot can pick it
+    // up via dispatchPendingBookingsToSocketPartner / recovery polling.
+    if (booking.bookingType === "scheduled") {
+      await Booking.findByIdAndUpdate(booking._id, {
+        $push: {
+          statusTimeline: {
+            status: "awaiting_scheduled_partner",
+            at: new Date(),
+            by: "system",
+            note: `No partner available for ${booking.scheduledSlotLabel || `${booking.scheduledDate} ${booking.scheduledSlot}`} yet`
+          }
+        }
+      });
+    }
+    emitNewBookingToPartners(booking, []);
+    return partners;
+  }
+
+  if (!booking.requestedPartners || booking.requestedPartners.length === 0) {
+    const dispatchedAt = new Date();
+    const requestExpiresAt = partnerRequestExpiresAt(dispatchedAt);
+    const dispatchAttempt = Number(booking.dispatchAttempt || 0) + 1;
+    const tracking = { requestExpiresAt, partnerRequests: [], statusTimeline: [] };
+    const partnerRequests = addPartnerRequests(tracking, partners, {
+      match,
+      source: "automatic",
+      dispatchAttempt,
+      dispatchStage: dispatchAttempt,
+      sentAt: dispatchedAt,
+      actor: "system"
+    });
+    const claimedBooking = await Booking.findOneAndUpdate(
+      {
+        _id: booking._id,
+        partnerId: null,
+        requestedPartners: { $size: 0 },
+        status: { $in: dispatchableBookingStatuses() }
+      },
+      {
+        $set: {
+          requestedPartners: partners.map((partner) => partner._id),
+          status: "sent_to_partner",
+          dispatchRadiusKm: match.radiusKm,
+          dispatchMode: match.mode,
+          dispatchedAt,
+          requestExpiresAt,
+          partnerRequests: tracking.partnerRequests
+        },
+        $inc: { dispatchAttempt: 1 },
+        $push: {
+          statusTimeline: {
+            $each: [
+              {
+                status: "sent_to_partner",
+                at: dispatchedAt,
+                by: "system",
+                note: match.mode === "customer_location"
+                  ? `Matched verified partners within ${match.radiusKm} km`
+                  : "Matched verified partners using city fallback"
+              },
+              ...tracking.statusTimeline
+            ]
+          }
+        }
+      },
+      { new: true }
+    );
+    if (!claimedBooking) {
+      return [];
+    }
+
+    emitNewBookingToPartners(claimedBooking, partners);
+    for (const request of partnerRequests) {
+      emitAdminEvent("booking:partner_request_sent", partnerRequestEventPayload(claimedBooking, request));
+    }
+    reliableNotify({
+      recipients: partners.map(partnerRecipient),
+      title: claimedBooking.emergency?.isEmergency ? "Emergency Booking Request" : "New Booking Request",
+      body: claimedBooking.emergency?.isEmergency
+        ? `${claimedBooking.serviceName} emergency near ${claimedBooking.city}`
+        : `${claimedBooking.serviceName} near ${claimedBooking.city}`,
+      category: claimedBooking.emergency?.isEmergency ? "emergency_booking" : "booking_request",
+      priority: "high",
+      data: {
+        type: claimedBooking.emergency?.isEmergency ? "booking:emergency_request" : "booking:new_request",
+        event: "booking:new_request",
+        action: "OPEN_BOOKING",
+        category: "booking_request",
+        bookingId: claimedBooking.bookingId || claimedBooking.publicId || claimedBooking.bookingCode,
+        booking_id: String(claimedBooking._id),
+        internalBookingId: String(claimedBooking._id),
+        bookingCode: claimedBooking.bookingCode,
+        serviceName: claimedBooking.serviceName,
+        serviceCategory: claimedBooking.serviceCategory,
+        serviceId: claimedBooking.serviceCategory,
+        serviceType: claimedBooking.serviceCategory,
+        // The customer's specific chosen sub-type (e.g. "Bathroom Cleaning")
+        // travels only in `issue`; forward it so the partner popup can show it.
+        issue: claimedBooking.issue || "",
+        status: claimedBooking.status,
+        customerName: claimedBooking.userSnapshot?.name || "Customer",
+        location: claimedBooking.city || "",
+        paymentMethod: "Pay after service",
+        createdAt: claimedBooking.createdAt?.toISOString?.() || new Date().toISOString(),
+        requestExpiresAt: claimedBooking.requestExpiresAt?.toISOString?.() || "",
+        emergencyType: claimedBooking.emergency?.type || "none",
+        emergencyPriority: claimedBooking.emergency?.priority || "normal",
+        bookingType: claimedBooking.bookingType || "instant",
+        scheduledDate: claimedBooking.scheduledDate || "",
+        scheduledSlot: claimedBooking.scheduledSlot || "",
+        scheduledSlotLabel: claimedBooking.scheduledSlotLabel || ""
+      },
+      smsBody: claimedBooking.emergency?.isEmergency
+        ? `ApnaServo Emergency: ${claimedBooking.serviceName} near ${claimedBooking.city}. Open partner app now.`
+        : ""
+    })
+      .then((delivery) => recordPartnerRequestDeliveryResults(claimedBooking._id, partnerRequests, delivery.results))
+      .catch((error) => {
+        console.error("Partner booking push notification failed", {
+          bookingId: String(claimedBooking._id),
+          bookingCode: claimedBooking.bookingCode,
+          message: error.message
+        });
+        return recordPartnerRequestDeliveryResults(
+          claimedBooking._id,
+          partnerRequests,
+          partnerRequests.map(() => ({ pushStatus: "failed", pushError: error.message }))
+        );
+      });
+  }
+
+  return partners;
+}
+
+function queueBookingDispatch(booking, category, lat, lng) {
+  const bookingId = booking?._id;
+  if (!bookingId) return;
+  setImmediate(async () => {
+    try {
+      const current = await Booking.findById(bookingId);
+      if (!current || current.partnerId || current.requestedPartners?.length) return;
+      await dispatchBookingToPartners(current, category, lat, lng);
+    } catch (error) {
+      console.error("Queued partner dispatch failed", {
+        bookingId: String(bookingId),
+        message: error.message
+      });
+    }
+  });
+}
+
+async function dispatchToSpecificPartner(booking, partner) {
+  const dispatchedAt = new Date();
+  const requestExpiresAt = partnerRequestExpiresAt(dispatchedAt);
+  const tracking = { requestExpiresAt, partnerRequests: [], statusTimeline: [] };
+  const partnerRequests = addPartnerRequests(tracking, [partner], {
+    match: { radiusKm: 0, mode: "partner_requested" },
+    source: "customer_requested",
+    dispatchAttempt: 1,
+    dispatchStage: 1,
+    sentAt: dispatchedAt,
+    actor: "customer"
+  });
+  const claimedBooking = await Booking.findOneAndUpdate(
+    { _id: booking._id, partnerId: null, requestedPartners: { $size: 0 }, status: { $in: dispatchableBookingStatuses() } },
+    {
+      $set: {
+        requestedPartners: [partner._id],
+        status: "sent_to_partner",
+        dispatchMode: "partner_requested",
+        dispatchedAt,
+        requestExpiresAt,
+        partnerRequests: tracking.partnerRequests
+      },
+      $inc: { dispatchAttempt: 1 },
+      $push: { statusTimeline: { $each: [{ status: "sent_to_partner", at: dispatchedAt, by: "system", note: "Dispatched to customer-requested partner" }, ...tracking.statusTimeline] } }
+    },
+    { new: true }
+  );
+  if (!claimedBooking) return;
+  emitNewBookingToPartners(claimedBooking, [partner]);
+  emitAdminEvent("booking:partner_request_sent", partnerRequestEventPayload(claimedBooking, tracking.partnerRequests[0]));
+  reliableNotify({
+    recipients: [partnerRecipient(partner)],
+    title: "New Booking Request",
+    body: `${claimedBooking.serviceName} near ${claimedBooking.city}`,
+    category: "booking_request",
+    priority: "high",
+    data: {
+      type: "booking:new_request",
+      event: "booking:new_request",
+      action: "OPEN_BOOKING",
+      bookingId: claimedBooking.bookingId || claimedBooking.publicId || claimedBooking.bookingCode,
+      booking_id: String(claimedBooking._id),
+      bookingCode: claimedBooking.bookingCode,
+      serviceName: claimedBooking.serviceName,
+      serviceCategory: claimedBooking.serviceCategory,
+      // Specific sub-type (e.g. "Sofa Cleaning") lives only in `issue`.
+      issue: claimedBooking.issue || "",
+      status: claimedBooking.status,
+      requestExpiresAt: claimedBooking.requestExpiresAt?.toISOString?.() || "",
+      bookingType: claimedBooking.bookingType || "instant",
+      scheduledDate: claimedBooking.scheduledDate || "",
+      scheduledSlot: claimedBooking.scheduledSlot || "",
+      scheduledSlotLabel: claimedBooking.scheduledSlotLabel || ""
+    }
+  }).then((delivery) => recordPartnerRequestDeliveryResults(claimedBooking._id, partnerRequests, delivery.results))
+    .catch(() => recordPartnerRequestDeliveryResults(claimedBooking._id, partnerRequests, partnerRequests.map(() => ({ pushStatus: "failed" }))));
+}
+
+async function recoverRecentUndispatchedBookings(partner, categories) {
+  if (!partnerCanViewOpenJobs(partner) || !categories.length) return;
+  const candidates = await Booking.find({
+    partnerId: null,
+    requestedPartners: { $size: 0 },
+    status: { $in: dispatchableBookingStatuses() },
+    serviceCategory: { $in: categories }
+  }).sort({ createdAt: -1 }).limit(10);
+
+  for (const booking of candidates) {
+    const coordinates = booking.location?.coordinates || [];
+    if (!findNearbyPartners.validCoordinates(coordinates[1], coordinates[0])) continue;
+    await dispatchBookingToPartners(
+      booking,
+      booking.serviceCategory,
+      coordinates[1],
+      coordinates[0]
+    );
+  }
+}
+
+async function getOrCreateUser(req, body) {
+  const existing = await User.findOne({ firebaseUid: req.auth.uid })
+    .select("_id name phone phoneVerified phoneVerifiedAt")
+    .lean();
+  const phone = body.userPhone || req.auth.phone_number || existing?.phone || "";
+  const normalizedPhone = normalizePhone(phone);
+  const email = normalizeEmail(req.auth.email || "");
+  const verified = firebasePhoneVerified(req, phone)
+    || Boolean(existing?.phoneVerified && normalizePhone(existing.phone) === normalizedPhone);
+  const now = new Date();
+  const requestedName = firstRealCustomerName(body.userName, body.name, body.fullName, req.auth.name);
+  const update = {
+    $set: {
+      phone,
+      phoneHash: normalizedPhone.length === 10 ? identityHash(normalizedPhone) : "",
+      email,
+      emailHash: identityHash(email),
+      city: body.city || "Guwahati",
+      address: body.address || "",
+      bookingRiskStatus: verified ? "trusted" : "otp_required",
+      lastLoginAt: now,
+      location: { type: "Point", coordinates: [Number(body.lng), Number(body.lat)] }
+    },
+    $setOnInsert: {
+      registrationHistory: [{
+        source: "booking_create",
+        provider: "firebase",
+        registeredAt: now,
+        ip: req.ip || "",
+        userAgent: req.get("user-agent") || ""
+      }]
+    }
+  };
+  if (requestedName && isPlaceholderCustomerName(existing?.name)) {
+    update.$set.name = requestedName;
+  }
+  if (!existing && !update.$set.name) {
+    update.$set.name = "ApnaServo Customer";
+  }
+  if (verified) {
+    update.$set.phoneVerified = true;
+    update.$set.phoneVerifiedAt = new Date();
+  } else {
+    update.$set.phoneVerified = false;
+    update.$set.phoneVerifiedAt = null;
+  }
+  const user = await User.findOneAndUpdate(
+    { firebaseUid: req.auth.uid },
+    update,
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+  const normalizedAddress = String(body.address || "").trim().toLowerCase();
+  const alreadySaved = normalizedAddress && (user.savedAddresses || []).some(
+    (entry) => String(entry.address || "").trim().toLowerCase() === normalizedAddress
+  );
+  if (normalizedAddress && !alreadySaved) {
+    user.savedAddresses.push({
+      label: user.savedAddresses.length ? "Service address" : "Primary",
+      address: body.address,
+      city: body.city || "Guwahati",
+      location: {
+        type: "Point",
+        coordinates: [Number(body.lng || 91.7362), Number(body.lat || 26.1445)]
+      },
+      isDefault: user.savedAddresses.length === 0,
+      updatedAt: now
+    });
+    await user.save();
+  }
+  if (!existing) {
+    emitAdminEvent("user:registered", {
+      userId: String(user._id),
+      name: user.name,
+      phone: user.phone,
+      email: user.email,
+      createdAt: user.createdAt
+    });
+  }
+  return user;
+}
+
+// ---------------------------------------------------------------------------
+// Scheduling helpers
+// ---------------------------------------------------------------------------
+const SLOT_LABELS = {
+  morning: "Morning (6am – 12pm)",
+  afternoon: "Afternoon (12pm – 5pm)",
+  evening: "Evening (5pm – 10pm)"
+};
+
+/**
+ * Returns today's and tomorrow's date strings in IST (UTC+5:30), "YYYY-MM-DD".
+ * Duplicated from partnerController intentionally — controllers are independent
+ * units and should not import each other.
+ */
+function istTodayTomorrow() {
+  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+  const now = Date.now() + IST_OFFSET_MS;
+  const toStr = (ms) => new Date(ms).toISOString().slice(0, 10);
+  return { today: toStr(now), tomorrow: toStr(now + 24 * 60 * 60 * 1000) };
+}
+
+/**
+ * Validates the scheduling fields on a booking create request.
+ * Returns { ok, bookingType, scheduledDate, scheduledSlot, scheduledSlotLabel, error }
+ */
+function validateScheduling(body) {
+  const bookingType = body.bookingType === "scheduled" ? "scheduled" : "instant";
+
+  if (bookingType === "instant") {
+    return { ok: true, bookingType, scheduledDate: "", scheduledSlot: "", scheduledSlotLabel: "" };
+  }
+
+  // --- scheduled path ---
+  const { today, tomorrow } = istTodayTomorrow();
+  const allowedDates = new Set([today, tomorrow]);
+
+  const scheduledDate = String(body.scheduledDate || "").trim();
+  if (!scheduledDate) {
+    return { ok: false, error: { status: 400, code: "SCHEDULED_DATE_REQUIRED", message: "A scheduled date is required for scheduled bookings." } };
+  }
+  if (!allowedDates.has(scheduledDate)) {
+    return { ok: false, error: { status: 400, code: "SCHEDULED_DATE_INVALID", message: `Scheduled date must be today (${today}) or tomorrow (${tomorrow}) in IST.` } };
+  }
+
+  const scheduledSlot = String(body.scheduledSlot || "").trim().toLowerCase();
+  if (!["morning", "afternoon", "evening"].includes(scheduledSlot)) {
+    return { ok: false, error: { status: 400, code: "SCHEDULED_SLOT_REQUIRED", message: "A time slot (morning / afternoon / evening) is required for scheduled bookings." } };
+  }
+
+  const dayLabel = scheduledDate === today ? "Today" : "Tomorrow";
+  const scheduledSlotLabel = `${dayLabel} ${SLOT_LABELS[scheduledSlot]}`;
+
+  return { ok: true, bookingType, scheduledDate, scheduledSlot, scheduledSlotLabel };
+}
+
+async function createBooking(req, res, next) {
+  try {
+    // Use the exact same published Control Center state returned by
+    // /bookings/launch-status.  The legacy date setting must never report the
+    // app as open while rejecting the corresponding create request.
+    const publishedControl = await getPublishedConfig();
+    const launch = effectiveBookingLaunchStatus(publishedControl);
+    if (!launch.bookingOpen) {
+      return res.status(423).json({
+        code: "BOOKING_PRELAUNCH",
+        message: `Service booking opens on ${launch.launchDateLabel}.`,
+        ...launch
+      });
+    }
+    const body = createBookingSchema.parse(req.body || {});
+    // Validate scheduling fields before any heavy lifting
+    const scheduling = validateScheduling(body);
+    if (!scheduling.ok) {
+      return res.status(scheduling.error.status).json({ code: scheduling.error.code, message: scheduling.error.message });
+    }
+    const locationRecovery = await recoverLegacyFallbackCoordinates(req.auth.uid, body);
+    if (locationRecovery.unresolvedFallback) {
+      return res.status(422).json({
+        code: "SERVICE_LOCATION_RESELECT_REQUIRED",
+        message: "We couldn't verify the exact service location. Please select the service address again."
+      });
+    }
+    const serviceArea = validateServiceArea(body.lat, body.lng, { address: body.address });
+    if (!serviceArea.allowed) {
+      return res.status(422).json({
+        code: serviceArea.code,
+        message: serviceArea.code === "SERVICE_AREA_LOCATION_REQUIRED"
+          ? "We couldn't verify the service location. Please select the location again."
+          : serviceArea.code === "NORTH_GUWAHATI_UNAVAILABLE"
+            ? "ApnaServo is not available in North Guwahati yet. We'll be available in your area soon."
+            : "ApnaServo is currently available only in Guwahati. We'll be available in your area soon."
+      });
+    }
+    const submittedPrimaryPhone = normalizeCustomerPhone(body.primaryPhone || body.userPhone);
+    const submittedAlternatePhone = normalizeCustomerPhone(body.alternatePhone);
+    if (body.alternatePhone && !submittedAlternatePhone) {
+      return res.status(400).json({ message: "Enter a valid alternate mobile number" });
+    }
+    if (submittedPrimaryPhone && submittedAlternatePhone && submittedPrimaryPhone === submittedAlternatePhone) {
+      return res.status(400).json({ message: "Primary and alternate numbers must be different" });
+    }
+    if (submittedPrimaryPhone) body.userPhone = submittedPrimaryPhone;
+    const category = normalizeServiceCategory(body.serviceCategory || serviceCategoryForEmergency(body.emergencyType));
+    const config = publishedControl.config;
+    if (body.commercial) {
+      const commercialRule = config.services?.commercial;
+      const commercialStatus = commercialRule && isScheduleActive(commercialRule)
+        ? commercialRule.status
+        : "AVAILABLE";
+      if (commercialStatus === "HIGH_DEMAND") {
+        return res.status(409).json({
+          message: commercialRule?.message || "Commercial services are currently receiving high demand. Please try again later.",
+          code: "COMMERCIAL_HIGH_DEMAND",
+          serviceStatus: commercialStatus
+        });
+      }
+      if (["PREPARING", "TEMPORARILY_UNAVAILABLE", "DISABLED"].includes(commercialStatus)) {
+        return res.status(409).json({
+          message: commercialRule?.message || "Commercial services are not accepting enquiries right now.",
+          code: "COMMERCIAL_NOT_AVAILABLE",
+          serviceStatus: commercialStatus
+        });
+      }
+    }
+    const formAnswers = validatedFormAnswers(config, category, body.formAnswers);
+    const service = await Service.findOne({ serviceCategory: { $in: serviceCategoryVariants(category) } }).lean();
+    // This is intentionally before user/profile creation.  A blocked booking
+    // attempt must not have any booking-side effects, even when called directly.
+    const availability = bookingAvailability(config, body);
+    if (!availability.allowed) return res.status(availability.httpStatus).json({ message: availability.message, code: availability.code });
+    const configuredService = config.services?.[category];
+    const configuredStatus = configuredService && isScheduleActive(configuredService) ? configuredService.status : "AVAILABLE";
+    const serviceStatus = configuredStatus !== "AVAILABLE" ? configuredStatus : (service?.availability || (service?.isActive === false ? "DISABLED" : "AVAILABLE"));
+    if (serviceStatus === "HIGH_DEMAND") {
+      return res.status(409).json({ message: configuredService?.message || service?.availabilityMessage || "This service is currently receiving a high number of requests. Please try another service or try again shortly.", code: "SERVICE_HIGH_DEMAND", serviceStatus });
+    }
+    if (["PREPARING", "TEMPORARILY_UNAVAILABLE", "DISABLED"].includes(serviceStatus)) {
+      return res.status(409).json({ message: configuredService?.message || service?.availabilityMessage || "This service is being prepared and is not accepting bookings right now", code: "SERVICE_NOT_AVAILABLE", serviceStatus });
+    }
+    const user = await getOrCreateUser(req, body);
+    const primaryPhone = submittedPrimaryPhone || normalizeCustomerPhone(user.phone);
+    if (!primaryPhone) {
+      return res.status(400).json({ message: "Primary mobile number is required for this booking" });
+    }
+    if (!normalizeCustomerPhone(user.phone)) {
+      user.phone = primaryPhone;
+      user.phoneHash = staffIdentityHash(primaryPhone);
+      await user.save();
+      emitAdminEvent("user:primary_phone_saved", {
+        userId: String(user._id),
+        userName: user.name,
+        phone: primaryPhone,
+        actorRole: "user"
+      });
+    }
+    if (requireCustomerOtp() && !user.phoneVerified) {
+      await User.findByIdAndUpdate(user._id, {
+        $inc: { fakeBookingWarningCount: 1 },
+        $set: { bookingRiskStatus: "otp_required" }
+      });
+      return res.status(403).json({ message: "Phone OTP verification required before booking" });
+    }
+    const hasCustomerLocation = findNearbyPartners.validCoordinates(body.lat, body.lng);
+    const lat = hasCustomerLocation ? Number(body.lat) : 0;
+    const lng = hasCustomerLocation ? Number(body.lng) : 0;
+    const dispatchLat = hasCustomerLocation ? lat : null;
+    const dispatchLng = hasCustomerLocation ? lng : null;
+    const requestedBookingId = String(body.bookingId || "").trim().toUpperCase();
+    if (requestedBookingId && body.bookingCode
+        && requestedBookingId !== String(body.bookingCode).trim().toUpperCase()) {
+      return res.status(400).json({ code: "BOOKING_ID_MISMATCH", message: "Booking ID does not match the idempotency key" });
+    }
+    // New production clients provide bookingId. Keep the legacy fallback only
+    // for already-released app versions so rollout does not break bookings.
+    const requestedBookingCode = requestedBookingId || body.bookingCode || bookingCode();
+    const emergency = emergencyPayload(body);
+
+    const identityFilter = requestedBookingId
+      ? { $or: [{ bookingId: requestedBookingId }, { bookingCode: requestedBookingId }, { publicId: requestedBookingId }] }
+      : { bookingCode: requestedBookingCode };
+    const existingBooking = await Booking.findOne(identityFilter);
+    if (existingBooking) {
+      if (String(existingBooking.userId) !== String(user._id)) {
+        return res.status(409).json({ message: "Booking code already exists" });
+      }
+
+      if (dispatchableBookingStatuses().includes(existingBooking.status)
+          && !existingBooking.requestedPartners?.length && !existingBooking.partnerId) {
+        queueBookingDispatch(existingBooking, existingBooking.serviceCategory || category, dispatchLat, dispatchLng);
+      }
+
+      return res.status(200).json({
+        booking: serializeBooking(existingBooking),
+        matchedPartners: existingBooking.requestedPartners?.length || 0,
+        dispatchQueued: dispatchableBookingStatuses().includes(existingBooking.status)
+          && !existingBooking.requestedPartners?.length && !existingBooking.partnerId,
+        idempotent: true
+      });
+    }
+
+    const maxActiveBookings = Number(config.booking?.maxActiveBookings || 10);
+    const activeBookingCount = await Booking.countDocuments({ userId: user._id, status: { $nin: ["completed", "cancelled", "expired"] } });
+    if (activeBookingCount >= maxActiveBookings) {
+      return res.status(409).json({ code: "MAX_ACTIVE_BOOKINGS", message: `You can have up to ${maxActiveBookings} active bookings at a time.` });
+    }
+
+    let booking;
+    try {
+      booking = await Booking.create({
+        ...(requestedBookingId ? { bookingId: requestedBookingId, publicId: requestedBookingId } : {}),
+        bookingCode: requestedBookingCode,
+        userId: user._id,
+        serviceCategory: category,
+        serviceName: body.serviceName || serviceLabel(category),
+        issue: body.issue || `Customer requested ${serviceLabel(category)} inspection`,
+        address: body.address,
+        addressDetails: {
+          houseFlat: body.houseFlat || "",
+          building: body.building || "",
+          floor: body.floor || "",
+          room: body.room || "",
+          landmark: body.landmark || ""
+        },
+        city: body.city || "Guwahati",
+        location: { type: "Point", coordinates: [lng, lat] },
+        locationVersion: 1,
+        locationUpdatedAt: new Date(),
+        locationUpdatedBy: "user",
+        contact: {
+          primaryPhone,
+          alternatePhone: submittedAlternatePhone,
+          updatedAt: new Date(),
+          updatedBy: "user"
+        },
+        price: body.price || 0,
+        // Reaching this write means authentication, payload, service-area,
+        // availability and customer verification have all succeeded. Persist
+        // confirmation before any partner-side request is allowed to exist.
+        status: "confirmed",
+        requestExpiresAt: null,
+        emergency,
+        formAnswers,
+        formSchemaVersion: Number(config.forms?.[category]?.version || 0),
+        appConfigVersion: Number(publishedControl.version || 0),
+        userSnapshot: {
+          name: firstRealCustomerName(body.userName, body.name, body.fullName, user.name) || user.name,
+          phone: primaryPhone,
+          email: user.email,
+          fcmToken: user.fcmToken
+        },
+        customerVerification: {
+          phoneVerified: Boolean(user.phoneVerified),
+          otpRequired: requireCustomerOtp(),
+          authPhone: req.auth.phone_number || "",
+          verifiedAt: user.phoneVerifiedAt || null,
+          riskStatus: user.phoneVerified ? "trusted" : "otp_required"
+        },
+        statusTimeline: [{
+          status: "confirmed",
+          at: new Date(),
+          by: "system",
+          note: emergency.isEmergency ? "Emergency booking confirmed by backend" : "Booking confirmed by backend"
+        }],
+        // Scheduling
+        bookingType: scheduling.bookingType,
+        scheduledDate: scheduling.scheduledDate,
+        scheduledSlot: scheduling.scheduledSlot,
+        scheduledSlotLabel: scheduling.scheduledSlotLabel
+      });
+    } catch (createError) {
+      if (createError?.code === 11000) {
+        const duplicate = await Booking.findOne(identityFilter);
+        if (duplicate && String(duplicate.userId) === String(user._id)) {
+          if (dispatchableBookingStatuses().includes(duplicate.status)
+              && !duplicate.requestedPartners?.length && !duplicate.partnerId) {
+            queueBookingDispatch(duplicate, duplicate.serviceCategory || category, dispatchLat, dispatchLng);
+          }
+          return res.status(200).json({
+            booking: serializeBooking(duplicate),
+            matchedPartners: duplicate.requestedPartners?.length || 0,
+            dispatchQueued: dispatchableBookingStatuses().includes(duplicate.status)
+              && !duplicate.requestedPartners?.length && !duplicate.partnerId,
+            idempotent: true
+          });
+        }
+      }
+      throw createError;
+    }
+
+    emitAdminEvent("booking:new_request", serializeBooking(booking));
+    // Match and emit before acknowledging creation. The former setImmediate
+    // path made the customer receive success while the partner request was
+    // still waiting in the event-loop queue (and relied on the poll recovery
+    // path under load). This guarantees that the socket event is emitted as
+    // part of the booking transaction's request lifecycle.
+    let matchedPartners;
+    if (body.requestedPartnerId) {
+      const { partner: requestedPartner, error: partnerError } = await validateRequestedPartner(
+        body.requestedPartnerId, category, dispatchLat, dispatchLng
+      );
+      if (partnerError) {
+        // Booking is already saved — cancel it and surface the error cleanly.
+        await Booking.findByIdAndUpdate(booking._id, {
+          $set: { status: "cancelled" },
+          $push: { statusTimeline: { status: "cancelled", at: new Date(), by: "system", note: partnerError.message } }
+        });
+        return res.status(partnerError.status).json({ code: partnerError.code, message: partnerError.message });
+      }
+      await dispatchToSpecificPartner(booking, requestedPartner);
+      matchedPartners = [requestedPartner];
+    } else {
+      matchedPartners = await dispatchBookingToPartners(
+        booking,
+        category,
+        dispatchLat,
+        dispatchLng
+      );
+    }
+    const dispatchedBooking = await Booking.findById(booking._id);
+    User.findByIdAndUpdate(user._id, { $set: { lastBookingAt: new Date() } }).catch((error) => {
+      console.error("Failed to update user last booking time", { userId: String(user._id), message: error.message });
+    });
+
+    return res.status(201).json({
+      booking: serializeBooking(dispatchedBooking || booking),
+      matchedPartners: matchedPartners.length,
+      dispatchQueued: false
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function listUserBookings(req, res, next) {
+  try {
+    const user = await User.findOne({ firebaseUid: req.auth.uid });
+    if (!user) return res.json({ bookings: [] });
+    const identityFilters = [];
+    if (user.phoneHash) identityFilters.push({ phoneHash: user.phoneHash });
+    if (req.auth.email_verified === true && user.emailHash) identityFilters.push({ emailHash: user.emailHash });
+    const linkedUsers = identityFilters.length
+      ? await User.find({ $or: identityFilters }).select("_id")
+      : [];
+    const userIds = [...new Set([String(user._id), ...linkedUsers.map((entry) => String(entry._id))])];
+    const refreshedBookings = await Booking.find({ userId: { $in: userIds } }).sort({ createdAt: -1 });
+    await expireQuotesIfNeeded(refreshedBookings);
+    return res.json({ bookings: refreshedBookings.map(serializeBooking) });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function listPartnerBookings(req, res, next) {
+  let partner;
+  let responseCacheKey = "";
+  try {
+    partner = await Partner.findOne({ firebaseUid: req.auth.uid });
+    if (!partner) return res.json({ bookings: [] });
+    await expireDuePartnerRequests();
+    responseCacheKey = `partner:bookings:${partner._id}`;
+
+    const categories = partnerCategoryVariants(partner);
+    const canViewOpenJobs = partnerCanViewOpenJobs(partner);
+    // Recover a request when the initial background dispatch ran while the
+    // partner's Android GPS/socket heartbeat was temporarily unavailable.
+    // Partner apps poll this endpoint, so a still-valid request is repaired
+    // immediately without requiring an offline/online toggle.
+    setImmediate(() => recoverRecentUndispatchedBookings(partner, categories).catch((error) => {
+      console.warn("partner_booking_recovery_failed", {
+        partnerId: String(partner._id),
+        message: error.message
+      });
+    }));
+    const companyServiceFilter = partner.businessType === "laundry"
+      ? { serviceCategory: { $in: categories } }
+      : {};
+    const bookings = await Booking.find({
+      $or: [
+        { partnerId: partner._id, ...companyServiceFilter },
+        {
+          partnerId: null,
+          requestedPartners: partner._id,
+          rejectedPartners: { $ne: partner._id },
+          status: { $in: pendingAssignmentStatuses() }
+        },
+        canViewOpenJobs ? partnerOpenBookingVisibility(partner, categories) : { _id: null }
+      ]
+    }).sort({ createdAt: -1 }).limit(80);
+
+    await repairLegacyFallbackBookingLocations(bookings);
+
+    setImmediate(() => expireQuotesIfNeeded(bookings).catch((error) => {
+      console.warn("partner_quote_expiry_failed", {
+        partnerId: String(partner._id),
+        message: error.message
+      });
+    }));
+
+    const now = new Date();
+    const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOfWeek = new Date(startOfDay);
+    const mondayOffset = (startOfWeek.getDay() + 6) % 7;
+    startOfWeek.setDate(startOfWeek.getDate() - mondayOffset);
+    const activeStatuses = ["accepted", "on_the_way", "arrived", "started", "amount_pending", "customer_no_response"];
+    const amountExpression = {
+      $cond: [
+        { $gt: ["$completionAccounting.grossAmount", 0] },
+        "$completionAccounting.grossAmount",
+        { $cond: [{ $gt: ["$finalAmount", 0] }, "$finalAmount", { $ifNull: ["$price", 0] }] }
+      ]
+    };
+    let activeJobs = 0;
+    let handledRequests = 0;
+    let rejectedRequests = 0;
+    let earningsRows = [];
+    try {
+      [activeJobs, handledRequests, rejectedRequests, earningsRows] = await Promise.all([
+        Booking.countDocuments({ partnerId: partner._id, status: { $in: activeStatuses } }),
+        Booking.countDocuments({ partnerId: partner._id }),
+        Booking.countDocuments({ rejectedPartners: partner._id, partnerId: { $ne: partner._id } }),
+        Booking.aggregate([
+          { $match: { partnerId: partner._id, status: "completed" } },
+          {
+            $group: {
+              _id: null,
+              completedJobs: { $sum: 1 },
+              totalEarnings: { $sum: amountExpression },
+              todayEarnings: { $sum: { $cond: [{ $gte: ["$completedAt", startOfDay] }, amountExpression, 0] } },
+              weekEarnings: { $sum: { $cond: [{ $gte: ["$completedAt", startOfWeek] }, amountExpression, 0] } },
+              monthEarnings: { $sum: { $cond: [{ $gte: ["$completedAt", startOfMonth] }, amountExpression, 0] } }
+            }
+          }
+        ])
+      ]);
+    } catch (error) {
+      console.warn("partner_booking_stats_failed", {
+        partnerId: String(partner._id),
+        message: error.message
+      });
+    }
+    const earnings = earningsRows[0] || {};
+    const respondedRequests = handledRequests + rejectedRequests;
+    const responseRate = respondedRequests > 0 ? Math.round((handledRequests * 100) / respondedRequests) : 0;
+    const responsePayload = {
+      bookings: bookings.map((booking) => {
+        const payload = protectCustomerPhoneForPartner(serializeBooking(booking), booking, partner);
+        if (!booking.partnerId && pendingAssignmentStatuses().includes(String(booking.status || ""))) {
+          // Compatibility for already-installed Partner builds that used the
+          // booking creation time as a 10-minute visibility TTL. The canonical
+          // createdAt stays unchanged; only the open-request availability hint
+          // remains current until the request is handled or cancelled.
+          payload.createdAtMillis = now.getTime();
+        }
+        return payload;
+      }),
+      stats: {
+        activeJobs,
+        completedJobs: Number(earnings.completedJobs || 0),
+        responseRate,
+        todayEarnings: Number(earnings.todayEarnings || 0),
+        weekEarnings: Number(earnings.weekEarnings || 0),
+        monthEarnings: Number(earnings.monthEarnings || 0),
+        totalEarnings: Number(earnings.totalEarnings || 0),
+        updatedAt: now.toISOString()
+      }
+    };
+    await cache.setJson(responseCacheKey, responsePayload, 90);
+    return res.json(responsePayload);
+  } catch (error) {
+    const cached = responseCacheKey ? await cache.getJson(responseCacheKey) : null;
+    if (cached) {
+      console.warn("partner_bookings_cached_fallback", {
+        partnerId: String(partner?._id || "unknown"),
+        reason: error.message
+      });
+      return res.json({ ...cached, cached: true, degraded: true });
+    }
+    console.error("partner_bookings_failed", {
+      uidSuffix: String(req.auth?.uid || "").slice(-6),
+      reason: error.message
+    });
+    return next(error);
+  }
+}
+
+async function acceptBooking(req, res, next) {
+  try {
+    const acceptDetails = acceptBookingSchema.parse(req.body || {});
+    const partner = await Partner.findOne({ firebaseUid: req.auth.uid });
+    if (!partner) return res.status(404).json({ message: "Partner profile not found" });
+    const blockReason = partnerAcceptBlockReason(partner);
+    if (blockReason) {
+      return res.status(403).json({ message: blockReason });
+    }
+
+    const bookingId = req.params.bookingId;
+    const acceptedAt = new Date();
+    const expectedArrivalAt = new Date(acceptedAt.getTime() + acceptDetails.arrivalEstimateMinutes * 60 * 1000);
+    const arrivalEstimateLabel = acceptDetails.arrivalEstimateLabel
+      || `${acceptDetails.arrivalEstimateMinutes} minutes`;
+    const idFilter = bookingIdFilter(bookingId);
+    const query = {
+      partnerId: null,
+      $and: [
+        idFilter,
+        partnerOpenBookingVisibility(partner, partnerCategoryVariants(partner))
+      ]
+    };
+
+    const booking = await Booking.findOneAndUpdate(
+      query,
+      {
+        $set: {
+          partnerId: partner._id,
+          status: "accepted",
+          acceptedAt,
+          partnerArrivalEstimateMinutes: acceptDetails.arrivalEstimateMinutes,
+          partnerArrivalEstimateLabel: arrivalEstimateLabel,
+          expectedArrivalAt,
+          partnerSnapshot: {
+            name: partner.name,
+            phone: partner.phone,
+            rating: partner.rating,
+            ratingCount: partner.ratingCount || 0,
+            photoUrl: partner.photoUrl || partner.selfieUrl || "",
+            fcmToken: partner.fcmToken
+          }
+        },
+        $push: { statusTimeline: { status: "accepted", at: acceptedAt, by: "partner" } }
+      },
+      { new: true }
+    );
+
+    if (!booking) {
+      const current = await Booking.findOne(idFilter);
+      if (current && String(current.partnerId || "") === String(partner._id)) {
+        return res.json({ booking: serializeBooking(current), idempotent: true });
+      }
+      return res.status(409).json({ message: "Booking already accepted or unavailable" });
+    }
+
+    const requestResponse = markRequestResponse(booking, partner._id, "accepted", { at: acceptedAt });
+    if (requestResponse.changed) {
+      await booking.save();
+      emitAdminEvent("booking:partner_request_accepted", partnerRequestEventPayload(booking, requestResponse.request));
+    }
+    emitBookingAccepted(booking, partner);
+
+    const user = await User.findById(booking.userId);
+    await reliableNotify({
+      recipients: [userRecipient(user)],
+      title: "Partner Assigned",
+      body: `${partner.name} has been assigned and expects to arrive in ${arrivalEstimateLabel}`,
+      category: "booking_assigned",
+      priority: "high",
+      data: { type: "booking:accepted", bookingId: booking._id, bookingCode: booking.bookingCode },
+      smsBody: `ApnaServo: ${partner.name} has been assigned for booking ${booking.bookingCode} and expects to arrive in ${arrivalEstimateLabel}.`
+    });
+
+    return res.json({ booking: serializeBooking(booking) });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function rejectBooking(req, res, next) {
+  try {
+    const rejection = rejectBookingSchema.parse(req.body || {});
+    const partner = await Partner.findOne({ firebaseUid: req.auth.uid });
+    if (!partner) return res.status(404).json({ message: "Partner profile not found" });
+    const blockReason = partnerAcceptBlockReason(partner);
+    if (blockReason) {
+      return res.status(403).json({ message: blockReason });
+    }
+
+    const now = new Date();
+    const booking = await Booking.findOneAndUpdate(
+      {
+        $and: [
+          bookingIdFilter(String(req.params.bookingId || "")),
+          partnerOpenBookingVisibility(partner, partnerCategoryVariants(partner))
+        ],
+        status: { $in: pendingAssignmentStatuses() },
+        partnerId: null
+      },
+      {
+        $addToSet: { rejectedPartners: partner._id },
+        $push: { statusTimeline: { status: "rejected", at: now, by: "partner" } }
+      },
+      { new: true }
+    );
+
+    if (booking) {
+      const requestResponse = markRequestResponse(booking, partner._id, "rejected", {
+        at: now,
+        reason: rejection.reason
+      });
+      if (requestResponse.changed) {
+        emitAdminEvent("booking:partner_request_rejected", partnerRequestEventPayload(booking, requestResponse.request));
+      }
+      const requestedIds = (booking.requestedPartners || []).map((id) => String(id));
+      const rejectedIds = new Set((booking.rejectedPartners || []).map((id) => String(id)));
+      const allRequestedRejected = requestedIds.length > 0 && requestedIds.every((id) => rejectedIds.has(id));
+      if (allRequestedRejected && !booking.partnerId && booking.status === "sent_to_partner") {
+        booking.status = "pending";
+        booking.requestedPartners = [];
+        booking.statusTimeline.push({ status: "awaiting_partner_after_rejection", at: now, by: "system" });
+        await booking.save();
+        const coordinates = booking.location?.coordinates || [];
+        queueBookingDispatch(
+          booking,
+          booking.serviceCategory,
+          findNearbyPartners.validCoordinates(coordinates[1], coordinates[0]) ? coordinates[1] : null,
+          findNearbyPartners.validCoordinates(coordinates[1], coordinates[0]) ? coordinates[0] : null
+        );
+      } else if (requestResponse.changed) {
+        await booking.save();
+      }
+      emitBookingRejected(booking, partner._id);
+    }
+
+    return res.json({ ok: true, booking: booking ? serializeBooking(booking) : null });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function cancelCustomerBooking(req, res, next) {
+  try {
+    const user = await User.findOne({ firebaseUid: req.auth.uid });
+    if (!user) {
+      return res.status(403).json({ message: "Customer account not found" });
+    }
+
+    const bookingFilter = bookingIdFilter(String(req.params.bookingId || ""));
+    const now = new Date();
+    const booking = await Booking.findOneAndUpdate(
+      {
+        ...bookingFilter,
+        userId: user._id,
+        status: { $in: ["pending", "sent_to_partner", "accepted", "on_the_way", "arrived"] }
+      },
+      {
+        $set: { status: "cancelled", cancelledAt: now },
+        $push: { statusTimeline: { status: "cancelled", at: now, by: "user" } }
+      },
+      { new: true }
+    );
+
+    if (!booking) {
+      const current = await Booking.findOne({ ...bookingFilter, userId: user._id });
+      if (!current) return res.status(404).json({ message: "Booking not found" });
+      if (["cancelled", "canceled"].includes(current.status)) {
+        return res.json({ booking: serializeBooking(current), idempotent: true });
+      }
+      return res.status(409).json({ message: "Booking cannot be cancelled after work starts" });
+    }
+
+    const serialized = serializeBooking(booking);
+    emitBookingStatusUpdate(booking);
+    emitAdminEvent("booking:cancelled", serialized);
+    res.json({ booking: serialized });
+
+    setImmediate(async () => {
+      try {
+        const assignedPartner = booking.partnerId ? await Partner.findById(booking.partnerId) : null;
+        await reliableNotify({
+          recipients: [partnerRecipient(assignedPartner)].filter(Boolean),
+          title: "Booking Cancelled",
+          body: `Customer cancelled booking ${booking.bookingCode}.`,
+          category: "booking_status",
+          priority: "high",
+          data: { type: "booking:status_update", status: "cancelled", bookingId: booking._id, bookingCode: booking.bookingCode },
+          smsBody: `ApnaServo: Customer cancelled booking ${booking.bookingCode}.`
+        });
+      } catch (notificationError) {
+        console.error("Cancellation partner notification failed:", notificationError.message);
+      }
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function updateStatus(req, res, next) {
+  try {
+    const requestedStatus = String(req.body?.status || "");
+    const nextStatus = normalizeBookingStatusInput(requestedStatus);
+    if (!nextStatus || !BOOKING_STATUSES.includes(nextStatus)) {
+      return res.status(400).json({ message: "Invalid booking status" });
+    }
+
+    // Resolve a company-staff identity first. This prevents an old independent
+    // partner profile on the same Firebase account from accidentally granting
+    // owner-level status permissions to an assigned staff member.
+    const staffActor = await findLaundryStaffActor(req.auth);
+    const partner = staffActor ? null : await Partner.findOne({ firebaseUid: req.auth.uid });
+    const actingPartner = partner || staffActor?.partner || null;
+    const user = await User.findOne({ firebaseUid: req.auth.uid });
+    const query = bookingIdFilter(String(req.params.bookingId || ""));
+    const finalAmount = Number(req.body?.finalAmount || 0);
+    const structuredCompletedTasks = Array.isArray(req.body?.completedTasks)
+      ? req.body.completedTasks.map((task, index) => ({
+          taskId: String(typeof task === "object" && task ? task.taskId : `task_${index}`).trim().slice(0, 100),
+          name: String(typeof task === "object" && task ? task.name : task || "").trim().slice(0, 160)
+        })).filter((task) => task.name).slice(0, 30)
+      : [];
+    const completedTasks = [...new Set(structuredCompletedTasks.map((task) => task.name))];
+    const additionalWork = String(req.body?.workDescription || req.body?.additionalWork || "").trim().slice(0, 1000);
+    const partnerNotes = String(req.body?.additionalNotes || req.body?.partnerNotes || "").trim().slice(0, 1000);
+    const customWork = Array.isArray(req.body?.customWork)
+      ? [...new Set(req.body.customWork.map((item) => String(item || "").trim()).filter(Boolean))].slice(0, 20)
+      : [];
+    const checklistVersion = Math.max(1, Math.min(100000, Number(req.body?.checklistVersion || 1)));
+    const now = new Date();
+    let actorRole = "";
+    if (partner) {
+      if (!PARTNER_STATUS_UPDATES.includes(nextStatus)) {
+        return res.status(403).json({ message: "Partner cannot apply this booking status" });
+      }
+      actorRole = "partner";
+      query.partnerId = partner._id;
+    } else if (staffActor) {
+      if (!PARTNER_STATUS_UPDATES.includes(nextStatus)) {
+        return res.status(403).json({ message: "Staff cannot apply this booking status" });
+      }
+      if (nextStatus === "cancelled") {
+        return res.status(403).json({ message: "Assigned staff cannot cancel a company order" });
+      }
+      actorRole = "staff";
+      query.partnerId = staffActor.partner._id;
+    } else if (user && CUSTOMER_STATUS_UPDATES.includes(nextStatus)) {
+      actorRole = "user";
+      const identityFilters = [];
+      if (user.phoneHash) identityFilters.push({ phoneHash: user.phoneHash });
+      if (req.auth.email_verified === true && user.emailHash) identityFilters.push({ emailHash: user.emailHash });
+      const linkedUsers = identityFilters.length
+        ? await User.find({ $or: identityFilters }).select("_id").lean()
+        : [];
+      query.userId = {
+        $in: [...new Set([String(user._id), ...linkedUsers.map((entry) => String(entry._id))])]
+      };
+    } else {
+      return res.status(403).json({ message: "Not allowed to update this booking" });
+    }
+
+    const currentBooking = await Booking.findOne(query);
+    if (!currentBooking) {
+      return res.status(404).json({ message: "Booking not found" });
+    }
+
+    if (partner?.businessType === "laundry" && partnerCategoryVariants(partner).includes("laundry")) {
+      return res.status(403).json({ message: "Laundry owners can accept and assign orders only. The assigned staff member updates live status." });
+    }
+    if (staffActor) {
+      const assignment = currentBooking.laundryAssignment || {};
+      const assignedToStaff = Number(assignment.staffSequence || 0) === Number(staffActor.staff.sequence || 0)
+        || (assignment.staffFirebaseUid && assignment.staffFirebaseUid === req.auth.uid)
+        || (assignment.staffPhoneHash && assignment.staffPhoneHash === staffIdentityHash(normalizeStaffPhone(req.auth?.phone_number || "")))
+        || (assignment.staffEmailHash && assignment.staffEmailHash === staffIdentityHash(req.auth?.email_verified === true ? normalizeStaffEmail(req.auth.email) : ""));
+      if (!assignedToStaff) {
+        return res.status(403).json({ message: "Only the staff member assigned to this order can update its live status" });
+      }
+    }
+
+    if (currentBooking.status === "completed" && nextStatus === "completed") {
+      return res.json({ booking: serializeBooking(currentBooking), idempotent: true });
+    }
+
+    if (nextStatus === "amount_pending") {
+      if (!actingPartner) {
+        return res.status(403).json({ message: "Only assigned staff can request the final amount" });
+      }
+      if (!Number.isFinite(finalAmount) || finalAmount <= 0) {
+        return res.status(400).json({ message: "Final amount required" });
+      }
+      if (completedTasks.length === 0) {
+        return res.status(400).json({ message: "Select at least one completed work item" });
+      }
+    }
+
+    const expiredQuote = await expireQuoteIfNeeded(currentBooking, { emit: true });
+    if (expiredQuote && nextStatus === "completed") {
+      return res.status(410).json({ message: "Quote expired. Ask partner to send a fresh quote." });
+    }
+
+    const decision = transitionDecision({
+      currentStatus: currentBooking.status,
+      nextStatus,
+      actorRole,
+      quoteStatus: currentBooking.quoteStatus
+    });
+    if (!decision.ok) {
+      return res.status(409).json({ message: decision.reason });
+    }
+
+    if (decision.idempotent) {
+      if (nextStatus === "amount_pending") {
+        const currentAmount = Number(currentBooking.grossAmount || currentBooking.finalAmount || currentBooking.quoteAmount || 0);
+        if (Math.round(finalAmount) !== Math.round(currentAmount)) {
+          return res.status(409).json({ message: "A quote is already pending customer approval" });
+        }
+      }
+      return res.json({ booking: serializeBooking(currentBooking), idempotent: true });
+    }
+
+    if (nextStatus === "completed") {
+      const quoteStatus = approvalQuoteStatus(currentBooking);
+      if (actingPartner && quoteStatus !== "payment_submitted") {
+        return res.status(409).json({ message: "Customer payment confirmation is pending" });
+      }
+      if (!actingPartner && quoteStatus !== "pending") {
+        return res.status(409).json({ message: "Quote is not ready for approval" });
+      }
+      if (currentBooking.quoteExpiresAt && new Date(currentBooking.quoteExpiresAt).getTime() <= now.getTime()) {
+        return res.status(410).json({ message: "Quote expired. Ask partner to send a fresh quote." });
+      }
+    }
+
+    if (actingPartner && ["on_the_way", "arrived", "started"].includes(nextStatus) && hasStatusLocationPayload(req.body)) {
+      const validation = validatePartnerLocation({
+        partner: actingPartner,
+        booking: currentBooking,
+        payload: req.body || {},
+        requireNearCustomer: nextStatus === "arrived"
+      });
+      await LocationLog.create({
+        partnerId: actingPartner._id,
+        bookingId: currentBooking._id,
+        bookingCode: currentBooking.bookingCode,
+        lat: Number.isFinite(validation.lat) ? validation.lat : 0,
+        lng: Number.isFinite(validation.lng) ? validation.lng : 0,
+        accuracy: validation.accuracy,
+        provider: validation.provider,
+        isMock: validation.isMock,
+        validationStatus: validation.valid ? "accepted" : "rejected",
+        reason: validation.reason,
+        speedMps: validation.speedMps,
+        distanceToCustomerM: validation.distanceToCustomerM,
+        recordedAt: validation.recordedAt
+      });
+      if (!validation.valid) {
+        await Partner.findByIdAndUpdate(actingPartner._id, { $set: { locationTrustStatus: "suspicious" } });
+        console.warn("Ignoring non-blocking status location validation failure", {
+          bookingId: String(currentBooking._id),
+          partnerId: String(actingPartner._id),
+          status: nextStatus,
+          reason: validation.reason
+        });
+      } else {
+        await Partner.findByIdAndUpdate(actingPartner._id, { $set: partnerLocationUpdate(validation) });
+      }
+    }
+
+    const update = {
+      $set: { status: nextStatus },
+      $push: { statusTimeline: { status: nextStatus, at: now, by: staffActor ? "laundry_staff" : (partner ? "partner" : "user") } }
+    };
+    if (nextStatus === "amount_pending") {
+      const quoteExpiresAt = quoteExpiresAtFrom(now);
+      const grossAmount = Math.round(finalAmount);
+      const applied = await bestDiscountForBooking(currentBooking, grossAmount, now);
+      const roundedFinalAmount = grossAmount - applied.amount;
+      update.$set.grossAmount = grossAmount;
+      update.$set.discount = { ruleId: applied.rule?._id || null, name: applied.rule?.name || "", type: applied.rule?.discountType || "", value: applied.rule?.value || 0, amount: applied.amount, appliedAt: now };
+      update.$set.finalAmount = roundedFinalAmount;
+      update.$set.quoteAmount = roundedFinalAmount;
+      update.$set.quoteStatus = "pending";
+      update.$set.quoteRequestedAt = now;
+      update.$set.quoteExpiresAt = quoteExpiresAt;
+      update.$set.quoteApprovedAt = null;
+      update.$set.quoteCounterAmount = 0;
+      update.$set.quoteCounterMessage = "";
+      update.$set.quoteCounterAt = null;
+      update.$set.paymentStatus = "pending";
+      update.$set.amountRequestedAt = now;
+      update.$set.workCompletion = {
+        completedTasks: [...completedTasks, ...customWork],
+        additionalWork,
+        partnerNotes,
+        submittedBy: String(actingPartner?.name || currentBooking.partnerSnapshot?.name || "Service Partner"),
+        submittedAt: now
+      };
+      update.$set.serviceWorkDetails = {
+        description: additionalWork,
+        completedTasks: structuredCompletedTasks,
+        customWork,
+        additionalNotes: partnerNotes,
+        checklistVersion,
+        submittedBy: String(actingPartner?.name || currentBooking.partnerSnapshot?.name || "Service Partner"),
+        submittedAt: now
+      };
+      update.$push.quoteHistory = {
+        kind: "partner_quote",
+        amount: roundedFinalAmount,
+        by: staffActor ? "laundry_staff" : "partner",
+        message: staffActor ? "Assigned laundry staff sent price quote" : "Partner sent price quote",
+        at: now
+      };
+    }
+    if (staffActor) {
+      const staffTaskStatus = {
+        on_the_way: "on_the_way",
+        arrived: "picked_up",
+        started: "out_for_delivery",
+        amount_pending: "delivered",
+        completed: "completed"
+      }[nextStatus];
+      if (staffTaskStatus) {
+        update.$set["laundryAssignment.taskStatus"] = staffTaskStatus;
+      }
+      if (nextStatus === "completed") {
+        update.$set["laundryAssignment.completedAt"] = now;
+      }
+    }
+    if (nextStatus === "completed") {
+      const approvedAmount = Math.round(Number(currentBooking.finalAmount || currentBooking.quoteAmount || currentBooking.price || 0));
+      const warrantyDays = warrantyDaysFor(currentBooking);
+      update.$set.completedAt = now;
+      update.$set.paymentStatus = "paid";
+      update.$set.quoteStatus = "approved";
+      update.$set.quoteApprovedAt = now;
+      update.$set.finalAmount = approvedAmount;
+      update.$set.quoteAmount = approvedAmount;
+      update.$set["warranty.eligible"] = warrantyDays > 0;
+      update.$set["warranty.serviceDate"] = now;
+      update.$set["warranty.warrantyDays"] = warrantyDays;
+      update.$set["warranty.warrantyEndDate"] = warrantyDays > 0 ? warrantyEndDateFrom(now, warrantyDays) : null;
+      update.$set["warranty.revisitRequested"] = false;
+      update.$push.quoteHistory = {
+        kind: "quote_approved",
+        amount: approvedAmount,
+        by: actingPartner ? (staffActor ? "laundry_staff" : "partner") : "user",
+        message: actingPartner ? (staffActor ? "Assigned laundry staff verified direct payment" : "Partner verified direct payment") : "Customer approved price quote",
+        at: now
+      };
+    }
+
+    const atomicQuery = {
+      _id: currentBooking._id,
+      status: currentBooking.status,
+      ...(actingPartner ? { partnerId: actingPartner._id } : { userId: user._id })
+    };
+    if (nextStatus === "completed") {
+      atomicQuery.quoteStatus = "pending";
+      if (actingPartner) {
+        atomicQuery.quoteStatus = "payment_submitted";
+      }
+    }
+    if (nextStatus === "amount_pending" && currentBooking.status === "amount_pending") {
+      atomicQuery.quoteStatus = currentBooking.quoteStatus;
+    }
+
+    const booking = await Booking.findOneAndUpdate(atomicQuery, update, { new: true });
+    if (!booking) {
+      return res.status(409).json({ message: "Booking changed on another device. Refresh and try again." });
+    }
+
+    if (nextStatus === "completed" && booking.partnerId) {
+      await creditCompletedBookingOnce(booking);
+      // Credit one job toward the partner's referral eligibility (no-op if
+      // no referral exists or the threshold is already reached).
+      await creditReferralJobOnce(booking.partnerId).catch((err) =>
+        console.error("[referral] creditReferralJobOnce failed", err)
+      );
+      const paidAmount = Number(booking.finalAmount || booking.quoteAmount || 0);
+      const payment = await Payment.findOneAndUpdate(
+        { bookingId: booking._id, paymentMethod: "direct" },
+        {
+          $setOnInsert: {
+            bookingId: booking._id,
+            userId: booking.userId,
+            partnerId: booking.partnerId,
+            serviceAmount: paidAmount + Number(booking.discount?.amount || 0),
+            additionalCharges: 0,
+            discount: Number(booking.discount?.amount || 0),
+            tax: 0,
+            amount: paidAmount,
+            currency: "INR",
+            paymentMethod: "direct"
+          },
+          $set: { status: "paid", paidAt: now, verifiedAt: now }
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+      const [invoiceUser, invoicePartner] = await Promise.all([
+        User.findById(booking.userId),
+        Partner.findById(booking.partnerId)
+      ]);
+      await ensurePaidInvoice({ booking, payment, user: invoiceUser, partner: invoicePartner });
+    }
+
+    emitBookingStatusUpdate(booking);
+    if (nextStatus === "amount_pending") {
+      emitAdminEvent("booking:quote_sent", serializeBooking(booking));
+    } else if (nextStatus === "completed") {
+      emitAdminEvent("booking:payment_accepted", serializeBooking(booking));
+      emitAdminEvent("booking:completed", serializeBooking(booking));
+    } else if (nextStatus === "cancelled" || nextStatus === "canceled") {
+      emitAdminEvent("booking:cancelled", serializeBooking(booking));
+    } else if (nextStatus === "disputed") {
+      emitAdminEvent("booking:disputed", serializeBooking(booking));
+    }
+
+    const userForNotification = await User.findById(booking.userId);
+    if (["on_the_way", "arrived", "started", "amount_pending", "completed"].includes(nextStatus)) {
+      const statusNotificationCopy = {
+        on_the_way: {
+          title: "Partner On The Way",
+          body: `${booking.serviceName} partner is on the way.`
+        },
+        arrived: {
+          title: "Partner Arrived",
+          body: `${booking.serviceName} partner has arrived at your location.`
+        },
+        started: {
+          title: "Service Started",
+          body: `${booking.serviceName} work has started.`
+        },
+        amount_pending: {
+          title: "Approve Price Quote",
+          body: `Partner sent Rs ${booking.finalAmount}. Approve within 24 hours or send a counter offer.`
+        },
+        completed: {
+          title: "Booking Completed",
+          body: `${booking.serviceName} is completed.`
+        }
+      };
+      const notificationTitle = statusNotificationCopy[nextStatus].title;
+      const notificationBody = statusNotificationCopy[nextStatus].body;
+      await reliableNotify({
+        recipients: [userRecipient(userForNotification)],
+        title: notificationTitle,
+        body: notificationBody,
+        category: "booking_status",
+        priority: "high",
+        data: { type: "booking:status_update", status: nextStatus, bookingId: booking._id, bookingCode: booking.bookingCode },
+        smsBody: `ApnaServo: ${notificationBody} Booking ${booking.bookingCode}.`
+      });
+    }
+
+    if (["cancelled", "disputed"].includes(nextStatus)) {
+      const partnerForNotification = booking.partnerId ? await Partner.findById(booking.partnerId) : null;
+      const recipients = partner
+        ? [userRecipient(userForNotification)]
+        : [partnerRecipient(partnerForNotification)].filter(Boolean);
+      const notificationTitle = nextStatus === "disputed" ? "Booking Disputed" : "Booking Cancelled";
+      const notificationBody = nextStatus === "disputed"
+        ? `Customer raised a dispute for booking ${booking.bookingCode}.`
+        : `Booking ${booking.bookingCode} was cancelled.`;
+      await reliableNotify({
+        recipients,
+        title: notificationTitle,
+        body: notificationBody,
+        category: "booking_status",
+        priority: "high",
+        data: { type: "booking:status_update", status: nextStatus, bookingId: booking._id, bookingCode: booking.bookingCode },
+        smsBody: `ApnaServo: ${notificationBody}`
+      });
+    }
+
+    if (!actingPartner && nextStatus === "completed" && booking.partnerId) {
+      const partnerForNotification = await Partner.findById(booking.partnerId);
+      await reliableNotify({
+        recipients: [partnerRecipient(partnerForNotification)],
+        title: "Payment Confirmed",
+        body: `Customer confirmed Rs ${booking.finalAmount || booking.price || 0}`,
+        category: "payment",
+        priority: "high",
+        data: { type: "booking:status_update", status: "completed", bookingId: booking._id, bookingCode: booking.bookingCode },
+        smsBody: `ApnaServo: Customer confirmed Rs ${booking.finalAmount || booking.price || 0} for booking ${booking.bookingCode}.`
+      });
+    }
+
+    return res.json({ booking: serializeBooking(booking) });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function counterOfferQuote(req, res, next) {
+  try {
+    const body = quoteCounterSchema.parse(req.body || {});
+    const user = await User.findOne({ firebaseUid: req.auth.uid });
+    if (!user) {
+      return res.status(404).json({ message: "Customer profile not found" });
+    }
+
+    const booking = await Booking.findOne({
+      ...bookingIdFilter(String(req.params.bookingId || "")),
+      userId: user._id,
+      status: "amount_pending"
+    });
+    if (!booking) {
+      return res.status(404).json({ message: "Pending quote not found" });
+    }
+    if (await expireQuoteIfNeeded(booking, { emit: true })) {
+      return res.status(410).json({ message: "Quote expired. Ask partner to send a fresh quote." });
+    }
+    const quoteStatus = approvalQuoteStatus(booking);
+    if (quoteStatus !== "pending") {
+      return res.status(409).json({ message: "Quote is not open for counter offer" });
+    }
+
+    const now = new Date();
+    booking.quoteStatus = "countered";
+    booking.quoteCounterAmount = Math.round(Number(body.amount));
+    booking.quoteCounterMessage = body.message || "";
+    booking.quoteCounterAt = now;
+    booking.statusTimeline.push({ status: "quote_countered", at: now, by: "user" });
+    booking.quoteHistory.push({
+      kind: "counter_offer",
+      amount: booking.quoteCounterAmount,
+      by: "user",
+      message: booking.quoteCounterMessage,
+      at: now
+    });
+    await booking.save();
+
+    const fraudScan = await recordFraudSignal({
+      booking,
+      userId: user._id,
+      actorRole: "user",
+      source: "quote_counter",
+      message: body.message || "",
+      metadata: { counterAmount: booking.quoteCounterAmount }
+    });
+
+    emitBookingStatusUpdate(booking);
+    emitAdminEvent("booking:quote_countered", serializeBooking(booking));
+
+    if (booking.partnerId) {
+      const partner = await Partner.findById(booking.partnerId);
+      await reliableNotify({
+        recipients: [partnerRecipient(partner)],
+        title: "Counter Offer Received",
+        body: `Customer offered Rs ${booking.quoteCounterAmount} for ${booking.serviceName}.`,
+        category: "quote",
+        priority: "high",
+        data: {
+          type: "booking:quote_counter",
+          bookingId: booking._id,
+          bookingCode: booking.bookingCode,
+          status: booking.status,
+          quoteStatus: booking.quoteStatus
+        },
+        smsBody: `ApnaServo: Customer sent counter offer Rs ${booking.quoteCounterAmount} for booking ${booking.bookingCode}.`
+      });
+    }
+
+    return res.json({ booking: serializeBooking(booking), fraudWarning: fraudScan.flagged });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function monitorBookingChat(req, res, next) {
+  try {
+    const body = chatMonitorSchema.parse(req.body || {});
+    const booking = await Booking.findOne(bookingIdFilter(String(req.params.bookingId || "")));
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found" });
+    }
+
+    const partner = await Partner.findOne({ firebaseUid: req.auth.uid });
+    const user = await User.findOne({ firebaseUid: req.auth.uid });
+    let actorRole = "";
+    if (partner && String(booking.partnerId || "") === String(partner._id)) {
+      actorRole = "partner";
+    } else if (user && String(booking.userId || "") === String(user._id)) {
+      actorRole = "user";
+    } else {
+      return res.status(403).json({ message: "Not allowed to monitor this booking chat" });
+    }
+
+    const fraudScan = await recordFraudSignal({
+      booking,
+      partnerId: booking.partnerId,
+      userId: booking.userId,
+      actorRole,
+      source: body.source || "booking_chat",
+      message: body.message,
+      metadata: { clientMessageId: body.clientMessageId || "" }
+    });
+
+    return res.json({
+      ok: true,
+      flagged: fraudScan.flagged,
+      severity: fraudScan.severity,
+      matchedTerms: fraudScan.matchedTerms || []
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function reportCustomerNoResponse(req, res, next) {
+  try {
+    const body = noResponseReportSchema.parse(req.body || {});
+    const partner = await Partner.findOne({ firebaseUid: req.auth.uid });
+    if (!partner) {
+      return res.status(404).json({ message: "Partner profile not found" });
+    }
+
+    const booking = await Booking.findOne({
+      ...bookingIdFilter(String(req.params.bookingId || "")),
+      partnerId: partner._id,
+      status: { $in: ["on_the_way", "arrived", "started"] }
+    });
+    if (!booking) {
+      return res.status(404).json({ message: "Active assigned booking not found" });
+    }
+
+    const validation = validatePartnerLocation({
+      partner,
+      booking,
+      payload: {
+        ...body,
+        accuracy: body.accuracy || 9999,
+        provider: body.provider || "unknown",
+        recordedAt: body.recordedAt || Date.now()
+      },
+      requireNearCustomer: true
+    });
+    await LocationLog.create({
+      partnerId: partner._id,
+      bookingId: booking._id,
+      bookingCode: booking.bookingCode,
+      lat: Number.isFinite(validation.lat) ? validation.lat : 0,
+      lng: Number.isFinite(validation.lng) ? validation.lng : 0,
+      accuracy: validation.accuracy,
+      provider: validation.provider,
+      isMock: validation.isMock,
+      validationStatus: validation.valid ? "accepted" : "rejected",
+      reason: validation.reason,
+      speedMps: validation.speedMps,
+      distanceToCustomerM: validation.distanceToCustomerM,
+      recordedAt: validation.recordedAt
+    });
+    if (!validation.valid) {
+      await Partner.findByIdAndUpdate(partner._id, { $set: { locationTrustStatus: "suspicious" } });
+      return res.status(422).json({ message: validation.reason });
+    }
+
+    const report = await CustomerNoResponseReport.create({
+      bookingId: booking._id,
+      bookingCode: booking.bookingCode,
+      partnerId: partner._id,
+      userId: booking.userId,
+      reason: body.reason,
+      evidenceUrl: body.evidenceUrl || "",
+      lat: validation.lat,
+      lng: validation.lng,
+      accuracy: validation.accuracy,
+      provider: validation.provider,
+      reportedAt: new Date()
+    });
+
+    booking.status = "customer_no_response";
+    booking.noResponseReport = {
+      reported: true,
+      reportedAt: report.reportedAt,
+      reason: body.reason,
+      lat: validation.lat,
+      lng: validation.lng,
+      accuracy: validation.accuracy,
+      evidenceUrl: body.evidenceUrl || ""
+    };
+    booking.statusTimeline.push({ status: "customer_no_response", at: new Date(), by: "partner" });
+    await booking.save();
+    await User.findByIdAndUpdate(booking.userId, {
+      $inc: { fakeBookingWarningCount: 1 },
+      $set: { bookingRiskStatus: "review" }
+    });
+    await Partner.findByIdAndUpdate(partner._id, { $set: partnerLocationUpdate(validation) });
+
+    emitBookingStatusUpdate(booking);
+    emitAdminEvent("booking:customer_no_response", {
+      ...serializeBooking(booking),
+      reportId: String(report._id),
+      reason: report.reason
+    });
+
+    const userForNotification = await User.findById(booking.userId);
+    await reliableNotify({
+      recipients: [userRecipient(userForNotification)],
+      title: "Customer Unavailable Reported",
+      body: "Partner reported no response at your service address. Support may contact you.",
+      category: "booking_status",
+      priority: "high",
+      data: {
+        type: "booking:customer_no_response",
+        bookingId: booking._id,
+        bookingCode: booking.bookingCode,
+        status: booking.status
+      },
+      smsBody: `ApnaServo: Partner reported no response for booking ${booking.bookingCode}. Support may contact you.`
+    });
+
+    return res.json({ ok: true, reportId: report._id, booking: serializeBooking(booking) });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function getBooking(req, res, next) {
+  try {
+    const bookingId = String(req.params.bookingId || "");
+    const query = bookingIdFilter(bookingId);
+    const booking = await Booking.findOne(query);
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found" });
+    }
+    await expireQuoteIfNeeded(booking, { emit: true });
+    const [partner, user] = await Promise.all([
+      Partner.findOne({ firebaseUid: req.auth.uid }),
+      User.findOne({ firebaseUid: req.auth.uid })
+    ]);
+    if (user && String(booking.userId || "") === String(user._id)) {
+      return res.json({ booking: serializeBooking(booking) });
+    }
+    if (partner) {
+      const isAssignedPartner = String(booking.partnerId || "") === String(partner._id);
+      const isRequestedPartner = (booking.requestedPartners || []).some((partnerId) => String(partnerId) === String(partner._id));
+      const canViewOpenJobs = partnerCanViewOpenJobs(partner);
+      const canSeeOpenRequest = !booking.partnerId
+        && pendingAssignmentStatuses().includes(booking.status)
+        && canViewOpenJobs
+        && isRequestedPartner
+        && !booking.rejectedPartners?.some((partnerId) => String(partnerId) === String(partner._id));
+      if (!isAssignedPartner && !canSeeOpenRequest) {
+        return res.status(403).json({ message: "Not allowed to access this booking" });
+      }
+      if (canSeeOpenRequest) {
+        const viewResult = markRequestViewed(booking, partner._id, { source: "booking_opened" });
+        if (viewResult.changed) {
+          await booking.save();
+          emitAdminEvent("booking:partner_request_viewed", partnerRequestEventPayload(booking, viewResult.request));
+        }
+      }
+      return res.json({ booking: protectCustomerPhoneForPartner(serializeBooking(booking), booking, partner) });
+    }
+    return res.status(403).json({ message: "Not allowed to access this booking" });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function recordBookingRequestViewed(req, res, next) {
+  try {
+    const partner = await Partner.findOne({ firebaseUid: req.auth.uid });
+    if (!partner) return res.status(404).json({ message: "Partner profile not found" });
+    const booking = await Booking.findOne({
+      $and: [
+        bookingIdFilter(String(req.params.bookingId || "")),
+        partnerOpenBookingVisibility(partner, partnerCategoryVariants(partner))
+      ],
+      partnerId: null,
+      requestedPartners: partner._id,
+      status: { $in: pendingAssignmentStatuses() }
+    });
+    if (!booking) return res.status(404).json({ message: "Active booking request not found" });
+    const result = markRequestViewed(booking, partner._id, { source: "partner_app" });
+    if (result.changed) {
+      await booking.save();
+      emitAdminEvent("booking:partner_request_viewed", partnerRequestEventPayload(booking, result.request));
+    }
+    return res.json({
+      ok: true,
+      idempotent: !result.changed,
+      requestId: result.request?.requestId || "",
+      status: result.request?.status || "viewed",
+      viewedAt: result.request?.viewedAt || null
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function requestLaunchNotification(req, res, next) {
+  try {
+    const launch = await getBookingLaunchConfig();
+    const now = new Date();
+    const user = await User.findOneAndUpdate(
+      { firebaseUid: req.auth.uid },
+      {
+        $set: {
+          launchNotificationRequestedAt: now,
+          launchNotificationFor: new Date(launch.bookingLaunchAt)
+        },
+        $setOnInsert: {
+          name: firstRealCustomerName(req.auth.name) || "ApnaServo Customer",
+          email: req.auth.email || ""
+        }
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    await ensureLaunchNotificationSchedule(launch);
+    emitAdminEvent("user:launch_notification_requested", {
+      userId: String(user._id),
+      bookingLaunchAt: launch.bookingLaunchAt,
+      requestedAt: now
+    });
+    return res.json({ requested: true, bookingLaunchAt: launch.bookingLaunchAt });
+  } catch (error) {
+    return next(error);
+  }
+}
+async function updateBookingContacts(req, res, next) {
+  try {
+    const body = bookingContactSchema.parse(req.body || {});
+    const user = await User.findOne({ firebaseUid: req.auth.uid });
+    if (!user) return res.status(404).json({ message: "User profile not found" });
+    const primaryPhone = normalizeCustomerPhone(body.primaryPhone);
+    const alternatePhone = normalizeCustomerPhone(body.alternatePhone);
+    if (!primaryPhone) return res.status(400).json({ message: "Enter a valid primary mobile number" });
+    if (body.alternatePhone && !alternatePhone) return res.status(400).json({ message: "Enter a valid alternate mobile number" });
+    if (alternatePhone && alternatePhone === primaryPhone) {
+      return res.status(400).json({ message: "Primary and alternate numbers must be different" });
+    }
+    const booking = await Booking.findOne({
+      ...bookingIdFilter(String(req.params.bookingId || "")),
+      userId: user._id
+    });
+    if (!booking) return res.status(404).json({ message: "Booking not found" });
+    booking.contact = { primaryPhone, alternatePhone, updatedAt: new Date(), updatedBy: "user" };
+    booking.userSnapshot.phone = primaryPhone;
+    booking.statusTimeline.push({ status: "contact_updated", at: new Date(), by: "user" });
+    await booking.save();
+    if (!normalizeCustomerPhone(user.phone)) {
+      user.phone = primaryPhone;
+      user.phoneHash = staffIdentityHash(primaryPhone);
+      await user.save();
+    }
+    emitBookingStatusUpdate(booking);
+    emitAdminEvent("booking:contact_updated", { ...serializeBooking(booking), actorRole: "user" });
+    return res.json({ booking: serializeBooking(booking), user: { primaryPhone: normalizeCustomerPhone(user.phone) } });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function updateBookingLocation(req, res, next) {
+  try {
+    const body = bookingLocationSchema.parse(req.body || {});
+    const serviceArea = validateServiceArea(body.lat, body.lng, { address: body.address });
+    if (!serviceArea.allowed) {
+      return res.status(422).json({
+        code: serviceArea.code,
+        message: serviceArea.code === "SERVICE_AREA_LOCATION_REQUIRED"
+          ? "We couldn't verify the service location. Please select the location again."
+          : serviceArea.code === "NORTH_GUWAHATI_UNAVAILABLE"
+            ? "ApnaServo is not available in North Guwahati yet. We'll be available in your area soon."
+            : "ApnaServo is currently available only in Guwahati. We'll be available in your area soon."
+      });
+    }
+    const user = await User.findOne({ firebaseUid: req.auth.uid });
+    if (!user) return res.status(404).json({ message: "User profile not found" });
+    const current = await Booking.findOne({
+      ...bookingIdFilter(String(req.params.bookingId || "")),
+      userId: user._id
+    });
+    if (!current) return res.status(404).json({ message: "Booking not found" });
+    if (["completed", "cancelled", "refunded"].includes(current.status)) {
+      return res.status(409).json({ message: "Location cannot be changed for a closed booking", booking: serializeBooking(current) });
+    }
+    const expectedVersion = Number(body.expectedVersion || current.locationVersion || 1);
+    const now = new Date();
+    const update = {
+      address: body.address,
+      city: body.city || current.city || "Guwahati",
+      location: { type: "Point", coordinates: [Number(body.lng), Number(body.lat)] },
+      addressDetails: {
+        houseFlat: body.houseFlat || "",
+        building: body.building || "",
+        floor: body.floor || "",
+        room: body.room || "",
+        landmark: body.landmark || ""
+      },
+      locationUpdatedAt: now,
+      locationUpdatedBy: "user",
+      locationChange: {
+        state: current.partnerId ? "pending_partner_ack" : "none",
+        reason: "",
+        changedAt: now,
+        respondedAt: null,
+        changedBy: "user"
+      }
+    };
+    const booking = await Booking.findOneAndUpdate(
+      { _id: current._id, locationVersion: expectedVersion },
+      {
+        $set: update,
+        $inc: { locationVersion: 1 },
+        $push: { statusTimeline: { status: "location_updated", at: now, by: "user", note: `Version ${expectedVersion + 1}` } }
+      },
+      { new: true }
+    );
+    if (!booking) {
+      const latest = await Booking.findById(current._id);
+      return res.status(409).json({ message: "Location changed on another device. Latest location returned.", booking: serializeBooking(latest) });
+    }
+    emitBookingStatusUpdate(booking);
+    emitAdminEvent("booking:location_updated", { ...serializeBooking(booking), actorRole: "user" });
+    if (booking.partnerId) {
+      const partner = await Partner.findById(booking.partnerId);
+      await reliableNotify({
+        recipients: [partnerRecipient(partner)].filter(Boolean),
+        title: "Service Location Updated",
+        body: `Customer updated the location for booking ${booking.bookingCode}. Please review it.`,
+        category: "booking_location_updated",
+        priority: "high",
+        data: { type: "booking:location_updated", bookingId: booking._id, bookingCode: booking.bookingCode }
+      });
+    }
+    return res.json({ booking: serializeBooking(booking) });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function respondToLocationChange(req, res, next) {
+  try {
+    const body = locationResponseSchema.parse(req.body || {});
+    const partner = await Partner.findOne({ firebaseUid: req.auth.uid });
+    if (!partner) return res.status(404).json({ message: "Partner profile not found" });
+    const booking = await Booking.findOne({
+      ...bookingIdFilter(String(req.params.bookingId || "")),
+      partnerId: partner._id
+    });
+    if (!booking) return res.status(404).json({ message: "Assigned booking not found" });
+    if (booking.locationChange?.state !== "pending_partner_ack") {
+      return res.status(409).json({ message: "No pending location change", booking: serializeBooking(booking) });
+    }
+    const now = new Date();
+    if (body.action === "accept") {
+      booking.locationChange.state = "accepted";
+      booking.locationChange.reason = body.reason || "";
+      booking.locationChange.respondedAt = now;
+      booking.statusTimeline.push({ status: "location_change_accepted", at: now, by: "partner" });
+    } else {
+      booking.locationChange.state = "rejected";
+      booking.locationChange.reason = body.reason || "Service location was changed and I cannot accept the new location.";
+      booking.locationChange.respondedAt = now;
+      booking.rejectedPartners.addToSet(partner._id);
+      booking.partnerId = null;
+      booking.partnerSnapshot = {};
+      booking.requestedPartners = [];
+      booking.status = "pending";
+      booking.statusTimeline.push({ status: "location_change_rejected", at: now, by: "partner", note: booking.locationChange.reason });
+    }
+    await booking.save();
+    emitBookingStatusUpdate(booking);
+    emitAdminEvent(body.action === "accept" ? "booking:location_change_accepted" : "booking:location_change_rejected", {
+      ...serializeBooking(booking),
+      actorRole: "partner",
+      partnerId: String(partner._id),
+      partnerName: partner.name
+    });
+    const user = await User.findById(booking.userId);
+    await reliableNotify({
+      recipients: [userRecipient(user)].filter(Boolean),
+      title: body.action === "accept" ? "Updated Location Accepted" : "Finding Another Partner",
+      body: body.action === "accept"
+        ? `Your service partner accepted the updated location for ${booking.bookingCode}.`
+        : "The previous partner could not accept the updated location. We are finding another partner.",
+      category: "booking_location_response",
+      priority: "high",
+      data: { type: "booking:location_response", bookingId: booking._id, bookingCode: booking.bookingCode }
+    });
+    if (body.action === "reject") {
+      const coordinates = booking.location?.coordinates || [];
+      queueBookingDispatch(booking, booking.serviceCategory, coordinates[1], coordinates[0]);
+    }
+    return res.json({ booking: serializeBooking(booking) });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function createCallLog(req, res, next) {
+  try {
+    const body = callActionSchema.parse(req.body || {});
+    const [partner, user] = await Promise.all([
+      Partner.findOne({ firebaseUid: req.auth.uid }),
+      User.findOne({ firebaseUid: req.auth.uid })
+    ]);
+
+    const booking = await Booking.findOne(bookingIdFilter(String(req.params.bookingId || "")));
+    if (!booking) return res.status(404).json({ message: "Booking not found" });
+    const isPartner = partner && String(booking.partnerId || "") === String(partner._id);
+    const isUser = user && String(booking.userId || "") === String(user._id);
+    if (!isPartner && !isUser) {
+      return res.status(403).json({ message: "Only booking participants can start this call" });
+    }
+    if (!booking.partnerId) {
+      return res.status(409).json({ message: "Partner is not assigned yet" });
+    }
+
+    const [assignedPartner, bookingUser] = await Promise.all([
+      booking.partnerId ? Partner.findById(booking.partnerId) : null,
+      booking.userId ? User.findById(booking.userId) : null
+    ]);
+    const configuredVirtualNumber = virtualCallNumber();
+    const directNumber = isPartner
+      ? (body.contactType === "alternate"
+        ? booking.contact?.alternatePhone
+        : booking.contact?.primaryPhone || booking.userSnapshot?.phone || bookingUser?.phone || "")
+      : (booking.laundryAssignment?.staffPhone
+        || booking.partnerSnapshot?.phone
+        || assignedPartner?.phone
+        || "");
+    const virtualNumber = isPartner && configuredVirtualNumber ? configuredVirtualNumber : "";
+    const phoneNumber = virtualNumber || String(directNumber || "");
+    const status = body.action === "report"
+      ? "reported"
+      : virtualNumber
+        ? "virtual_call_ready"
+        : phoneNumber
+          ? "direct_call_ready"
+          : "virtual_call_unconfigured";
+
+    const log = await CallLog.create({
+      bookingId: booking._id,
+      bookingCode: booking.bookingCode,
+      partnerId: booking.partnerId,
+      userId: booking.userId,
+      action: body.action,
+      direction: isPartner ? "partner_to_customer" : "user_to_partner",
+      status,
+      customerPhoneMasked: maskPhone(directNumber),
+      virtualNumber: body.action === "start" ? virtualNumber : "",
+      reason: body.reason || "",
+      userAgent: req.get("user-agent") || "",
+      ip: req.ip || ""
+    });
+
+    const fraudScan = await recordFraudSignal({
+      booking,
+      partnerId: booking.partnerId,
+      userId: booking.userId,
+      actorRole: isPartner ? "partner" : "user",
+      source: body.action === "report" ? "call_report" : "call_start",
+      message: body.reason || "",
+      metadata: { callLogId: log._id, action: body.action }
+    });
+    emitAdminEvent("booking:call_log", {
+      ...serializeBooking(booking),
+      callLogId: String(log._id),
+      action: body.action,
+      status,
+      actorRole: isPartner ? "partner" : "user",
+      partnerId: String(booking.partnerId),
+      partnerName: booking.partnerSnapshot?.name || partner?.name || ""
+    });
+
+    return res.json({
+      ok: true,
+      callLogId: log._id,
+      maskedCustomerPhone: log.customerPhoneMasked,
+      virtualNumber: body.action === "start" ? virtualNumber : "",
+      phoneNumber: body.action === "start" ? phoneNumber : "",
+      canCall: body.action === "start" && Boolean(phoneNumber),
+      status,
+      fraudWarning: fraudScan.flagged
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function submitDirectPayment(req, res, next) {
+  try {
+    const user = await User.findOne({ firebaseUid: req.auth.uid });
+    if (!user) {
+      return res.status(404).json({ message: "Customer profile not found" });
+    }
+    const booking = await Booking.findOne({
+      ...bookingIdFilter(String(req.params.bookingId || "")),
+      userId: user._id
+    });
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found" });
+    }
+    if (booking.status !== "amount_pending") {
+      return res.status(409).json({ message: "Payment can be submitted only after partner sends the final amount" });
+    }
+    const quoteStatus = approvalQuoteStatus(booking);
+    if (quoteStatus === "payment_submitted") {
+      return res.json({ booking: serializeBooking(booking), idempotent: true });
+    }
+    if (quoteStatus !== "pending") {
+      return res.status(409).json({ message: "Quote is not ready for payment" });
+    }
+    if (booking.quoteExpiresAt && new Date(booking.quoteExpiresAt).getTime() <= Date.now()) {
+      return res.status(410).json({ message: "Quote expired. Ask partner to send a fresh quote." });
+    }
+
+    const now = new Date();
+    booking.quoteStatus = "payment_submitted";
+    booking.paymentSubmittedAt = now;
+    booking.paymentStatus = "pending";
+    booking.statusTimeline.push({ status: "payment_submitted", at: now, by: "user" });
+    booking.quoteHistory.push({
+      kind: "payment_submitted",
+      amount: Number(booking.finalAmount || booking.quoteAmount || booking.price || 0),
+      by: "user",
+      message: "Customer marked direct payment as paid to partner",
+      at: now
+    });
+    await booking.save();
+
+    emitBookingStatusUpdate(booking);
+    emitAdminEvent("booking:payment_submitted", serializeBooking(booking));
+
+    const partnerForNotification = booking.partnerId ? await Partner.findById(booking.partnerId) : null;
+    await reliableNotify({
+      recipients: [partnerRecipient(partnerForNotification)].filter(Boolean),
+      title: "Payment Submitted",
+      body: `Customer marked Rs ${booking.finalAmount || booking.quoteAmount || booking.price || 0} as paid for booking ${booking.bookingCode}. Verify after receiving it.`,
+      category: "payment",
+      priority: "high",
+      data: { type: "booking:payment_submitted", status: "amount_pending", bookingId: booking._id, bookingCode: booking.bookingCode },
+      smsBody: `ApnaServo: Customer marked payment as paid for booking ${booking.bookingCode}. Verify after receiving it.`
+    });
+
+    return res.json({ booking: serializeBooking(booking) });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function getTracking(req, res, next) {
+  try {
+    const booking = await Booking.findOne(bookingIdFilter(String(req.params.bookingId || "")));
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found" });
+    }
+
+    const [partner, user] = await Promise.all([
+      Partner.findOne({ firebaseUid: req.auth.uid }),
+      User.findOne({ firebaseUid: req.auth.uid })
+    ]);
+    const isAssignedPartner = partner && String(booking.partnerId || "") === String(partner._id);
+    const isBookingUser = user && String(booking.userId || "") === String(user._id);
+    if (!isAssignedPartner && !isBookingUser) {
+      return res.status(403).json({ message: "Not allowed to track this booking" });
+    }
+
+    const bookingPartner = booking.partnerId ? await Partner.findById(booking.partnerId) : null;
+    const recentLocations = booking.partnerId
+      ? await LocationLog.find({ bookingId: booking._id, partnerId: booking.partnerId, validationStatus: "accepted" })
+        .sort({ recordedAt: -1 })
+        .limit(20)
+      : [];
+    const latestLocation = recentLocations[0] || null;
+    return res.json({
+      tracking: serializeTracking({
+        booking,
+        partner: bookingPartner,
+        latestLocation,
+        recentLocations
+      })
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function createTechnicianSos(req, res, next) {
+  try {
+    const body = sosSchema.parse(req.body || {});
+    const partner = await Partner.findOne({ firebaseUid: req.auth.uid });
+    if (!partner) {
+      return res.status(404).json({ message: "Partner profile not found" });
+    }
+
+    const booking = await Booking.findOne({
+      ...bookingIdFilter(String(req.params.bookingId || "")),
+      partnerId: partner._id,
+      status: { $in: ["accepted", "on_the_way", "arrived", "started", "amount_pending"] }
+    });
+    if (!booking) {
+      return res.status(404).json({ message: "Active assigned booking not found" });
+    }
+
+    const sos = await TechnicianSos.create({
+      bookingId: booking._id,
+      bookingCode: booking.bookingCode,
+      partnerId: partner._id,
+      userId: booking.userId,
+      reason: body.reason || "emergency",
+      note: body.note || "",
+      lat: Number.isFinite(body.lat) ? body.lat : 0,
+      lng: Number.isFinite(body.lng) ? body.lng : 0,
+      accuracy: Number.isFinite(body.accuracy) ? body.accuracy : 9999
+    });
+
+    booking.latestSosId = sos._id;
+    booking.statusTimeline.push({ status: "technician_sos", at: new Date(), by: "partner" });
+    await booking.save();
+
+    const user = await User.findById(booking.userId);
+    await reliableNotify({
+      recipients: [userRecipient(user)],
+      title: "Technician SOS Alert",
+      body: `${partner.name} raised an SOS for booking ${booking.bookingCode}. Support has been alerted.`,
+      category: "technician_sos",
+      priority: "high",
+      data: {
+        type: "booking:technician_sos",
+        bookingId: booking._id,
+        bookingCode: booking.bookingCode,
+        sosId: sos._id,
+        reason: sos.reason
+      },
+      smsBody: `ApnaServo SOS: Technician raised emergency alert for booking ${booking.bookingCode}.`
+    });
+
+    emitBookingStatusUpdate(booking);
+    emitAdminEvent("booking:technician_sos", {
+      ...serializeBooking(booking),
+      sosId: String(sos._id),
+      reason: sos.reason
+    });
+    return res.status(201).json({
+      ok: true,
+      sos: {
+        id: String(sos._id),
+        bookingId: String(sos.bookingId),
+        bookingCode: sos.bookingCode,
+        reason: sos.reason,
+        status: sos.status,
+        createdAt: sos.createdAt ? sos.createdAt.toISOString() : ""
+      }
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function uploadJobProofPhoto(req, res, next) {
+  try {
+    const body = proofPhotoSchema.parse(req.body || {});
+    const file = req.file;
+    if (!file) {
+      return res.status(400).json({ message: "Proof photo is required" });
+    }
+
+    const partner = await Partner.findOne({ firebaseUid: req.auth.uid });
+    if (!partner) {
+      return res.status(404).json({ message: "Partner profile not found" });
+    }
+
+    const booking = await Booking.findOne({
+      ...bookingIdFilter(String(req.params.bookingId || "")),
+      partnerId: partner._id,
+      status: { $in: ["accepted", "on_the_way", "arrived", "started", "amount_pending", "completed"] }
+    });
+    if (!booking) {
+      return res.status(404).json({ message: "Assigned booking not found" });
+    }
+
+    const uploaded = await uploadProofToCloudinary(file, booking._id, body.stage);
+    const photo = await JobProofPhoto.create({
+      bookingId: booking._id,
+      bookingCode: booking.bookingCode,
+      partnerId: partner._id,
+      userId: booking.userId,
+      stage: body.stage,
+      ...uploaded,
+      mimeType: file.mimetype,
+      sizeBytes: file.size,
+      note: body.note || "",
+      lat: Number.isFinite(body.lat) ? body.lat : 0,
+      lng: Number.isFinite(body.lng) ? body.lng : 0,
+      accuracy: Number.isFinite(body.accuracy) ? body.accuracy : 9999
+    });
+
+    const incField = body.stage === "before" ? "proofSummary.beforeCount" : "proofSummary.afterCount";
+    await Booking.findByIdAndUpdate(booking._id, {
+      $inc: { [incField]: 1 },
+      $set: { "proofSummary.lastUploadedAt": new Date() },
+      $push: { statusTimeline: { status: `proof_${body.stage}_uploaded`, at: new Date(), by: "partner" } }
+    });
+
+    const user = await User.findById(booking.userId);
+    await reliableNotify({
+      recipients: [userRecipient(user)],
+      title: body.stage === "before" ? "Before Work Photo Added" : "After Work Photo Added",
+      body: `${partner.name} uploaded ${body.stage} work proof for booking ${booking.bookingCode}.`,
+      category: "job_proof",
+      priority: "normal",
+      data: {
+        type: "booking:proof_photo",
+        bookingId: booking._id,
+        bookingCode: booking.bookingCode,
+        stage: body.stage,
+        proofPhotoId: photo._id
+      }
+    });
+    emitAdminEvent("booking:proof_photo_uploaded", {
+      ...serializeBooking(booking),
+      proofPhotoId: String(photo._id),
+      stage: body.stage,
+      actorRole: "partner",
+      partnerId: String(partner._id),
+      partnerName: partner.name || ""
+    });
+
+    return res.status(201).json({ ok: true, proofPhoto: serializeProofPhoto(photo) });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function createRevisitRequest(req, res, next) {
+  try {
+    const body = revisitRequestSchema.parse(req.body || {});
+    const user = await User.findOne({ firebaseUid: req.auth.uid });
+    if (!user) {
+      return res.status(404).json({ message: "Customer profile not found" });
+    }
+
+    const booking = await Booking.findOne({
+      ...bookingIdFilter(String(req.params.bookingId || "")),
+      userId: user._id,
+      status: "completed"
+    });
+    if (!booking) {
+      return res.status(404).json({ message: "Completed booking not found" });
+    }
+
+    const warrantyEnd = booking.warranty?.warrantyEndDate ? new Date(booking.warranty.warrantyEndDate) : null;
+    if (!booking.warranty?.eligible || !warrantyEnd || warrantyEnd.getTime() < Date.now()) {
+      return res.status(409).json({ message: "Warranty period is over for this booking" });
+    }
+
+    const existingOpen = await RevisitRequest.findOne({
+      bookingId: booking._id,
+      status: { $in: ["open", "partner_notified", "scheduled"] }
+    });
+    if (existingOpen) {
+      return res.status(200).json({ revisitRequest: serializeRevisitRequest(existingOpen), idempotent: true });
+    }
+
+    const request = await RevisitRequest.create({
+      bookingId: booking._id,
+      bookingCode: booking.bookingCode,
+      userId: user._id,
+      partnerId: booking.partnerId,
+      reason: body.reason || "same_issue_again",
+      message: body.message || "Same issue again",
+      warrantyEndDate: warrantyEnd,
+      status: "partner_notified"
+    });
+
+    booking.warranty.revisitRequested = true;
+    booking.warranty.revisitRequestId = request._id;
+    booking.statusTimeline.push({ status: "revisit_requested", at: new Date(), by: "user" });
+    await booking.save();
+
+    const partner = booking.partnerId ? await Partner.findById(booking.partnerId) : null;
+    await reliableNotify({
+      recipients: [partnerRecipient(partner)].filter(Boolean),
+      title: "Revisit Request",
+      body: `Customer reported the same issue again for booking ${booking.bookingCode}.`,
+      category: "revisit_request",
+      priority: "high",
+      data: {
+        type: "booking:revisit_request",
+        bookingId: booking._id,
+        bookingCode: booking.bookingCode,
+        revisitRequestId: request._id
+      },
+      smsBody: `ApnaServo: Revisit requested for booking ${booking.bookingCode}. Customer says same issue again.`
+    });
+
+    emitBookingStatusUpdate(booking);
+    emitAdminEvent("booking:revisit_requested", {
+      ...serializeBooking(booking),
+      revisitRequestId: String(request._id),
+      reason: request.reason
+    });
+    return res.status(201).json({ revisitRequest: serializeRevisitRequest(request) });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function getBookingLaunchStatus(req, res, next) {
+  try {
+    const launch = effectiveBookingLaunchStatus(await getPublishedConfig());
+    return res.json({ success: true, ...launch });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function getServiceChecklist(req, res, next) {
+  try {
+    return res.json({ checklist: await getChecklist(req.params.serviceCategory) });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+module.exports = {
+  getBookingLaunchStatus,
+  requestLaunchNotification,
+  getServiceChecklist,
+  createBooking,
+  listUserBookings,
+  listPartnerBookings,
+  acceptBooking,
+  rejectBooking,
+  cancelCustomerBooking,
+  updateStatus,
+  expireQuoteIfNeeded,
+  getTracking,
+  createTechnicianSos,
+  uploadJobProofPhoto,
+  createRevisitRequest,
+  counterOfferQuote,
+  submitDirectPayment,
+  monitorBookingChat,
+  reportCustomerNoResponse,
+  getBooking,
+  recordBookingRequestViewed,
+  createCallLog,
+  updateBookingContacts,
+  updateBookingLocation,
+  respondToLocationChange
+};

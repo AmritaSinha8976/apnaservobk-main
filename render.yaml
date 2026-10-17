@@ -1,0 +1,55 @@
+services:
+  - type: web
+    name: apnaservo-backend
+    env: node
+    plan: starter
+    rootDir: .
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: CLIENT_ORIGIN
+        sync: false
+      - key: DEFAULT_PARTNER_RADIUS_KM
+        value: "5"
+      - key: NOTIFICATION_CONCURRENCY
+        value: "24"
+      - key: SOCKET_PING_INTERVAL_MS
+        value: "25000"
+      - key: SOCKET_PING_TIMEOUT_MS
+        value: "120000"
+      - key: FIREBASE_EXPIRED_TOKEN_GRACE_SECONDS
+        value: "0"
+      - key: PARTNER_SEARCH_RADIUS_STEPS_KM
+        value: "5,10"
+      - key: REQUIRE_CUSTOMER_PHONE_OTP
+        value: "false"
+      - key: CUSTOMER_APP_RELEASE_VERSION
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: ENCRYPTION_KEY
+        sync: false
+      - key: ADMIN_API_SECRET
+        sync: false
+      - key: ADMIN_FIREBASE_UIDS
+        sync: false
+      - key: ADMIN_EMAILS
+        sync: false
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false

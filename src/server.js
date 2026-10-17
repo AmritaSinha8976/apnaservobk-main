@@ -1,0 +1,294 @@
+require("dotenv").config();
+
+const http = require("http");
+const crypto = require("crypto");
+const express = require("express");
+const mongoose = require("mongoose");
+const cors = require("cors");
+const compression = require("compression");
+const helmet = require("helmet");
+const morgan = require("morgan");
+const rateLimit = require("express-rate-limit");
+
+const { allowedCorsOrigins, validateEnv } = require("./config/env");
+const connectDb = require("./config/db");
+const { initFirebase } = require("./config/firebase");
+const { initCloudinary } = require("./config/cloudinary");
+const userRoutes = require("./routes/userRoutes");
+const partnerRoutes = require("./routes/partnerRoutes");
+const bookingRoutes = require("./routes/bookingRoutes");
+const paymentRoutes = require("./routes/paymentRoutes");
+const invoiceRoutes = require("./routes/invoiceRoutes");
+const adminRoutes = require("./routes/adminRoutes");
+const employeeRoutes = require("./routes/employeeRoutes");
+const notificationRoutes = require("./routes/notificationRoutes");
+const reviewRoutes = require("./routes/reviewRoutes");
+const otpRoutes = require("./routes/otpRoutes");
+const publicInfoRoutes = require("./routes/publicInfoRoutes");
+const { initBookingSocket } = require("./sockets/bookingSocket");
+const { startNotificationScheduler } = require("./utils/notificationScheduler");
+const { startPartnerRequestExpiryScheduler } = require("./utils/bookingRequestExpiry");
+const { emitAdminEvent, emitPartnerEvent } = require("./sockets/bookingSocket");
+const cache = require("./config/cache");
+const { cdnFriendlyHeaders } = require("./middleware/cdnHeaders");
+const { requireHttpsInProduction } = require("./middleware/httpsOnly");
+const { rejectPlainSensitiveFields } = require("./middleware/securityGuard");
+const { publicConfig } = require("./controllers/appControlController");
+const { notFound, errorHandler } = require("./middleware/errorHandler");
+
+const app = express();
+const server = http.createServer(app);
+
+function redactedRequestUrl(req) {
+  return String(req.originalUrl || req.url || req.path || "")
+    .replace(/([?&](?:token|access_token|key)=)[^&]*/gi, "$1[REDACTED]");
+}
+
+morgan.token("safe-url", redactedRequestUrl);
+const productionAccessLogFormat = ':remote-addr - :remote-user [:date[clf]] ":method :safe-url HTTP/:http-version" :status :res[content-length] ":referrer" ":user-agent"';
+
+validateEnv();
+initFirebase();
+initCloudinary();
+initBookingSocket(server);
+
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
+server.keepAliveTimeout = Number(process.env.SERVER_KEEP_ALIVE_TIMEOUT_MS || 65000);
+server.headersTimeout = Number(process.env.SERVER_HEADERS_TIMEOUT_MS || 66000);
+server.requestTimeout = Number(process.env.SERVER_REQUEST_TIMEOUT_MS || 30000);
+app.use(requireHttpsInProduction);
+app.use(helmet({
+  hsts: process.env.NODE_ENV === "production"
+    ? { maxAge: 15552000, includeSubDomains: true, preload: true }
+    : false
+}));
+app.use(cdnFriendlyHeaders);
+app.use(cors({
+  origin(origin, callback) {
+    const allowed = allowedCorsOrigins();
+    if (!origin) {
+      return callback(null, true);
+    }
+    if (allowed.includes("*") && process.env.NODE_ENV !== "production") {
+      return callback(null, true);
+    }
+    return callback(null, allowed.includes(origin));
+  },
+  credentials: true
+}));
+// Production Android clients poll the partner feed frequently. Compress JSON
+// before it crosses mobile networks so a large booking history cannot keep a
+// slow radio busy long enough for the realtime transport to be starved.
+app.use(compression({ threshold: 1024 }));
+app.use(express.json({
+  limit: "2mb",
+  // Preserve the exact request bytes so webhook signatures (e.g. the Cashfree
+  // partner-subscription webhook) can be verified over the raw payload.
+  verify(req, res, buffer) {
+    req.rawBody = buffer && buffer.length ? buffer.toString("utf8") : "";
+  }
+}));
+app.use(express.urlencoded({ extended: true }));
+app.use((req, res, next) => {
+  const supplied = String(req.get("x-request-id") || "").trim();
+  req.requestId = /^[A-Za-z0-9._:-]{8,100}$/.test(supplied) ? supplied : crypto.randomUUID();
+  res.setHeader("x-request-id", req.requestId);
+  next();
+});
+app.use(rejectPlainSensitiveFields);
+app.use(morgan(process.env.NODE_ENV === "production" ? productionAccessLogFormat : "dev"));
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    limit: 120,
+    standardHeaders: "draft-7",
+    legacyHeaders: false
+  })
+);
+
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "apnaservo-backend",
+    release: String(process.env.RENDER_GIT_COMMIT || process.env.APP_RELEASE || "local").slice(0, 7),
+    realtime: "socket.io",
+    dataStore: "mongodb",
+    capabilities: {
+      partnerReapproval: true,
+      fastBookingDispatch: true,
+      partnerUploadAssets: true,
+      partnerPaymentVerification: true,
+      broadPartnerDispatch: true,
+      laundryBusinessOnboarding: true,
+      laundryStaffWorkspace: true,
+      deviceAuthFallback: process.env.NODE_ENV !== "production" && process.env.DISABLE_DEVICE_AUTH_FALLBACK === "false"
+    }
+  });
+});
+
+app.get("/ready", (req, res) => {
+  const mongoReady = mongoose.connection.readyState === 1;
+  res.status(mongoReady ? 200 : 503).json({
+    ok: mongoReady,
+    mongo: mongoReady ? "connected" : "not_ready",
+    cache: cache.status()
+  });
+});
+
+const weatherCache = new Map();
+app.get("/api/weather/current", async (req, res, next) => {
+  try {
+    const latitude = Number(req.query.lat);
+    const longitude = Number(req.query.lng);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)
+      || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+      return res.status(400).json({ ok: false, code: "INVALID_COORDINATES", message: "Valid lat and lng are required." });
+    }
+    const cacheKey = `${latitude.toFixed(2)}:${longitude.toFixed(2)}`;
+    const cached = weatherCache.get(cacheKey);
+    if (cached && Date.now() - cached.savedAt < 60 * 1000) {
+      return res.set("Cache-Control", "no-store").json(cached.payload);
+    }
+    const params = new URLSearchParams({
+      latitude: latitude.toFixed(5),
+      longitude: longitude.toFixed(5),
+      current: "weather_code,is_day,precipitation,rain,showers,cloud_cover",
+      timezone: "auto",
+      forecast_days: "1"
+    });
+    const response = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`, {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(7000)
+    });
+    if (!response.ok) {
+      const error = new Error(`Weather provider returned ${response.status}`);
+      error.status = 502;
+      throw error;
+    }
+    const provider = await response.json();
+    const current = provider && provider.current;
+    if (!current || !Number.isFinite(Number(current.weather_code))) {
+      const error = new Error("Weather provider returned an invalid response");
+      error.status = 502;
+      throw error;
+    }
+    const payload = {
+      ok: true,
+      source: "open-meteo",
+      latitude,
+      longitude,
+      fetchedAt: new Date().toISOString(),
+      current
+    };
+    weatherCache.set(cacheKey, { savedAt: Date.now(), payload });
+    if (weatherCache.size > 250) weatherCache.delete(weatherCache.keys().next().value);
+    return res.set("Cache-Control", "no-store").json(payload);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.get("/api/app-control/config", publicConfig);
+app.use(publicInfoRoutes);
+
+app.use("/api/users", userRoutes);
+app.use("/api/partner", partnerRoutes);
+app.use("/api/partners", partnerRoutes);
+app.use("/api/bookings", bookingRoutes);
+app.use("/api/payments", paymentRoutes);
+app.use("/api/invoices", invoiceRoutes);
+app.use("/api/notifications", notificationRoutes);
+app.use("/api/reviews", reviewRoutes);
+app.use("/api/otp", otpRoutes);
+app.use("/api/admin", adminRoutes);
+app.use("/api/employee", employeeRoutes);
+
+app.use(notFound);
+app.use(errorHandler);
+
+function keepAliveUrl() {
+  return String(
+    process.env.KEEP_ALIVE_URL
+    || process.env.PUBLIC_BACKEND_URL
+    || process.env.RENDER_EXTERNAL_URL
+    || ""
+  ).replace(/\/$/, "");
+}
+
+function startKeepAlive() {
+  if (String(process.env.DISABLE_BACKEND_KEEP_ALIVE || "").toLowerCase() === "true") return;
+  const baseUrl = keepAliveUrl();
+  if (!baseUrl || !/^https?:\/\//i.test(baseUrl)) return;
+  const intervalMs = Math.max(Number(process.env.BACKEND_KEEP_ALIVE_INTERVAL_MS || 8 * 60 * 1000), 60 * 1000);
+  const ping = async () => {
+    try {
+      await fetch(`${baseUrl}/health`, { method: "GET" });
+    } catch (error) {
+      console.warn("Backend keep-alive ping failed:", error.message);
+    }
+  };
+  setTimeout(ping, 30 * 1000).unref();
+  setInterval(ping, intervalMs).unref();
+}
+
+async function start() {
+  await connectDb();
+  try {
+    const { seedMonetizationDefaults } = require("./utils/platformSettings");
+    await seedMonetizationDefaults();
+  } catch (seedError) {
+    console.warn("[startup] monetization defaults seed failed", { message: seedError?.message });
+  }
+  startPartnerRequestExpiryScheduler({
+    onExpired: async ({ booking, expiredRequests }) => {
+      const payload = {
+        bookingId: String(booking._id),
+        bookingCode: booking.bookingCode || "",
+        serviceCategory: booking.serviceCategory || "",
+        status: "expired",
+        reason: "No partner accepted before the request deadline"
+      };
+      emitAdminEvent("booking:partner_request_expired", payload);
+      for (const request of expiredRequests) {
+        emitPartnerEvent(request.partnerId, "booking:unavailable", {
+          ...payload,
+          requestId: request.requestId || "",
+          removeFromQueue: true,
+          unavailableReason: "request_expired"
+        });
+      }
+    }
+  });
+  startNotificationScheduler();
+  startKeepAlive();
+  const port = Number(process.env.PORT || 5000);
+  server.listen(port, "0.0.0.0", () => {
+    console.log(`ApnaServo backend running on http://0.0.0.0:${port}`);
+  });
+}
+
+if (require.main === module) {
+  start().catch((error) => {
+    console.error("Failed to start ApnaServo backend:", error);
+    process.exit(1);
+  });
+
+  const shutdown = async (signal) => {
+    console.log(`${signal} received, closing ApnaServo backend`);
+    server.close(async () => {
+      await mongoose.connection.close(false);
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(1), 10000).unref();
+  };
+
+  process.once("SIGTERM", () => shutdown("SIGTERM"));
+  process.once("SIGINT", () => shutdown("SIGINT"));
+}
+
+module.exports = {
+  app,
+  server,
+  start
+};

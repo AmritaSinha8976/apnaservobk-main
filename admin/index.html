@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ApnaServo Admin — Sign In</title>
+  <link rel="stylesheet" href="admin.css">
+</head>
+<body>
+  <div class="login-wrap">
+    <div class="login-card card">
+      <div class="card-body">
+        <div class="login-logo">
+          <h1>ApnaServo</h1>
+          <p>Cleaning Services Admin</p>
+        </div>
+
+        <div id="alert" class="alert alert-error hidden"></div>
+
+        <form id="loginForm" novalidate>
+          <div class="form-group">
+            <label for="email">Email</label>
+            <input type="email" id="email" placeholder="admin@example.com" autocomplete="username" required>
+            <div class="field-error hidden" id="emailErr"></div>
+          </div>
+          <div class="form-group">
+            <label for="password">Password</label>
+            <input type="password" id="password" placeholder="••••••••" autocomplete="current-password" required>
+            <div class="field-error hidden" id="passErr"></div>
+          </div>
+          <button type="submit" class="btn btn-primary" style="width:100%" id="submitBtn">
+            Sign In
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <script src="admin.js"></script>
+  <script>
+    // Redirect if already logged in
+    if (getToken()) window.location.href = 'services.html';
+
+    const form = document.getElementById('loginForm');
+    const alertEl = document.getElementById('alert');
+    const submitBtn = document.getElementById('submitBtn');
+
+    function showAlert(msg) {
+      alertEl.textContent = msg;
+      alertEl.classList.remove('hidden');
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      alertEl.classList.add('hidden');
+
+      const email = document.getElementById('email').value.trim();
+      const password = document.getElementById('password').value;
+
+      if (!email) { document.getElementById('emailErr').textContent = 'Email is required'; document.getElementById('emailErr').classList.remove('hidden'); return; }
+      document.getElementById('emailErr').classList.add('hidden');
+      if (!password) { document.getElementById('passErr').textContent = 'Password is required'; document.getElementById('passErr').classList.remove('hidden'); return; }
+      document.getElementById('passErr').classList.add('hidden');
+
+      submitBtn.disabled = true;
+      submitBtn.innerHTML = '<span class="spinner"></span> Signing in…';
+
+      try {
+        const res = await fetch(apiBase() + '/api/admin/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          showAlert(data.message || 'Login failed. Check your credentials.');
+          return;
+        }
+        saveSession(data.token, { email: data.email || email, role: data.role || 'admin', name: data.name || email });
+        window.location.href = 'services.html';
+      } catch {
+        showAlert('Cannot reach the server. Make sure the backend is running.');
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = 'Sign In';
+      }
+    });
+  </script>
+</body>
+</html>

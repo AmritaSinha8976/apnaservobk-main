@@ -1,0 +1,3616 @@
+const mongoose = require("mongoose");
+const crypto = require("crypto");
+const User = require("../models/User");
+const Partner = require("../models/Partner");
+const PartnerDocument = require("../models/PartnerDocument");
+const PartnerUploadAsset = require("../models/PartnerUploadAsset");
+const { Booking } = require("../models/Booking");
+const Service = require("../models/Service");
+const Review = require("../models/Review");
+const ReviewDispute = require("../models/ReviewDispute");
+const InAppNotification = require("../models/InAppNotification");
+const AdminNotification = require("../models/AdminNotification");
+const Payment = require("../models/Payment");
+const BookingMessage = require("../models/BookingMessage");
+const CustomerNoResponseReport = require("../models/CustomerNoResponseReport");
+const LocationLog = require("../models/LocationLog");
+const RevisitRequest = require("../models/RevisitRequest");
+const TechnicianSos = require("../models/TechnicianSos");
+const SupportTicket = require("../models/SupportTicket");
+const AdminActivity = require("../models/AdminActivity");
+const cache = require("../config/cache");
+const { recomputePartnerRating } = require("../utils/ratingAggregation");
+const { emitAdminEvent, emitPartnerEvent, emitNewBookingToPartners, emitBookingStatusUpdate } = require("../sockets/bookingSocket");
+const { getBookingLaunchConfig, setBookingLaunchAt } = require("../utils/bookingLaunchConfig");
+const { getMonetizationConfig, setMonetizationSetting, KEYS: MONETIZATION_KEYS } = require("../utils/platformSettings");
+const billingService = require("../services/billingService");
+const { reliableNotify } = require("../utils/reliableNotify");
+const { activeDeviceTokens, tokenHash } = require("../utils/notificationTokens");
+const findNearbyPartners = require("../utils/findNearbyPartners");
+const { serviceCategoryVariants, serviceLabel, partnerCanServeService } = require("../utils/serviceCategory");
+const { partnerRequestableStatuses } = require("../utils/bookingLifecycle");
+const {
+  addPartnerRequests,
+  cancelOutstandingRequests,
+  effectiveStatus,
+  recordNotificationResult,
+  secondsBetween
+} = require("../utils/partnerRequestTracking");
+const { partnerAssetUrl, verifyPartnerAssetToken } = require("../utils/partnerUploadAssets");
+const { sendPartnerApprovalWelcomeEmails } = require("../utils/welcomeEmail");
+const { decryptString } = require("../utils/fieldCrypto");
+const { initFirebase } = require("../config/firebase");
+const { normalizeServiceCategory } = require("../utils/serviceCategory");
+const { partnerRequestExpiresAt } = require("../utils/bookingRequestExpiry");
+
+function normalizePartnerPhone(value) {
+  const valueDigits = String(value || "").replace(/\D/g, "");
+  const phone = valueDigits.length > 10 ? valueDigits.slice(-10) : valueDigits;
+  return /^[6-9]\d{9}$/.test(phone) ? phone : "";
+}
+
+function normalizePartnerEmail(value) {
+  const email = String(value || "").trim().toLowerCase();
+  return !email || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : "";
+}
+
+function partnerIdentityHash(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return "";
+  const secret = process.env.IDENTITY_HASH_PEPPER || process.env.ENCRYPTION_KEY || "apnaservo-dev-identity-hash";
+  return crypto.createHmac("sha256", secret).update(normalized).digest("hex");
+}
+
+function iso(value) {
+  return value ? new Date(value).toISOString() : "";
+}
+
+function money(value) {
+  return Number(value || 0);
+}
+
+function id(value) {
+  return value ? String(value) : "";
+}
+
+function objectId(value) {
+  const raw = String(value || "").trim();
+  return mongoose.isValidObjectId(raw) ? new mongoose.Types.ObjectId(raw) : null;
+}
+
+function regex(value) {
+  const text = String(value || "").trim();
+  return text ? new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i") : null;
+}
+
+function digits(value) {
+  return String(value || "").replace(/\D/g, "");
+}
+
+function decryptAdminRecord(value) {
+  if (typeof value === "string") return decryptString(value);
+  if (Array.isArray(value)) return value.map(decryptAdminRecord);
+  if (value && typeof value === "object") {
+    if (value instanceof Date || value instanceof mongoose.Types.ObjectId) return value;
+    if (typeof value.toObject === "function") return decryptAdminRecord(value.toObject({ getters: true }));
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, decryptAdminRecord(entry)]));
+  }
+  return value;
+}
+
+function includesText(value, query) {
+  const text = String(value || "").toLowerCase();
+  const needle = String(query || "").toLowerCase();
+  return needle ? text.includes(needle) : true;
+}
+
+function ticketCode() {
+  return `TCK-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(16).slice(2, 8).toUpperCase()}`;
+}
+
+function normalizeAccountStatus(value) {
+  const status = String(value || "active").toLowerCase();
+  if (status === "active") return "Active";
+  if (status === "suspended") return "Suspended";
+  if (status === "blocked" || status === "deleted" || status === "deletion_requested") return "Blocked";
+  return status.replace(/_/g, " ");
+}
+
+const LEGACY_PLACEHOLDER_LAT = 26.1445;
+const LEGACY_PLACEHOLDER_LNG = 91.7362;
+
+function coordinates(location) {
+  const list = location?.coordinates || [];
+  const lng = Number(list[0] || 0);
+  const lat = Number(list[1] || 0);
+  const isLegacyPlaceholder = Math.abs(lat - LEGACY_PLACEHOLDER_LAT) <= 0.0002
+    && Math.abs(lng - LEGACY_PLACEHOLDER_LNG) <= 0.0002;
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || isLegacyPlaceholder) return { lng: 0, lat: 0 };
+  return {
+    lng,
+    lat
+  };
+}
+
+function primaryAddress(user) {
+  user = decryptAdminRecord(user);
+  const saved = Array.isArray(user.savedAddresses) ? user.savedAddresses : [];
+  const defaultAddress = saved.find((entry) => entry.isDefault) || saved[0];
+  if (defaultAddress?.address) return defaultAddress.address;
+  return user.address || "";
+}
+
+function savedAddresses(user) {
+  user = decryptAdminRecord(user);
+  const saved = Array.isArray(user.savedAddresses) ? user.savedAddresses : [];
+  if (saved.length) {
+    return saved.map((entry) => ({
+      id: id(entry._id),
+      label: entry.label || "Saved",
+      address: entry.address || "",
+      city: entry.city || user.city || "",
+      isDefault: Boolean(entry.isDefault),
+      location: coordinates(entry.location)
+    }));
+  }
+  if (!user.address) return [];
+  return [{
+    id: "primary",
+    label: "Primary",
+    address: user.address,
+    city: user.city || "",
+    isDefault: true,
+    location: coordinates(user.location)
+  }];
+}
+
+function summarizeDeviceInfo(deviceInfo) {
+  deviceInfo = decryptAdminRecord(deviceInfo);
+  if (!deviceInfo || typeof deviceInfo !== "object" || Array.isArray(deviceInfo)) return "";
+  const values = [
+    deviceInfo.platform,
+    deviceInfo.os,
+    deviceInfo.osVersion,
+    deviceInfo.appVersion,
+    deviceInfo.model,
+    deviceInfo.manufacturer
+  ].filter(Boolean);
+  return values.length ? values.join(" / ") : "Device details unavailable";
+}
+
+function bookingTime(booking, statuses) {
+  const wanted = new Set(statuses);
+  const hit = (booking.statusTimeline || []).find((entry) => wanted.has(String(entry.status || "").toLowerCase()));
+  return hit?.at || null;
+}
+
+function bookingTimeline(booking, payments = [], messages = []) {
+  const events = [];
+  if (booking.createdAt) {
+    events.push({
+      event: "Booking created",
+      at: booking.createdAt,
+      by: "user",
+      note: `${booking.serviceName || booking.serviceCategory || "Service"} requested`
+    });
+  }
+  for (const entry of booking.statusTimeline || []) {
+    events.push({
+      event: String(entry.status || "status_update").replace(/_/g, " "),
+      at: entry.at || booking.updatedAt,
+      by: entry.by || "system",
+      note: ""
+    });
+  }
+  for (const entry of booking.quoteHistory || []) {
+    events.push({
+      event: String(entry.kind || "quote_update").replace(/_/g, " "),
+      at: entry.at,
+      by: entry.by || "system",
+      note: [entry.amount ? `Amount Rs ${entry.amount}` : "", entry.message || ""].filter(Boolean).join(" - ")
+    });
+  }
+  for (const payment of payments) {
+    events.push({
+      event: `Payment ${payment.status || "created"}`,
+      at: payment.createdAt,
+      by: "payment",
+      note: `${payment.currency || "INR"} ${payment.amount || 0}`
+    });
+  }
+  for (const message of messages) {
+    events.push({
+      event: "Chat message",
+      at: message.createdAt,
+      by: message.senderRole || "chat",
+      note: message.message || ""
+    });
+  }
+  return events
+    .filter((entry) => entry.at)
+    .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime())
+    .map((entry) => ({ ...entry, at: iso(entry.at) }));
+}
+
+function partnerRequestSummary(requests = [], booking = {}) {
+  const latest = Array.isArray(requests) ? requests : [];
+  const count = (predicate) => latest.filter(predicate).length;
+  const accepted = latest.find((request) => String(request.status || "") === "accepted");
+  const uniquePartners = new Set(latest.map((request) => String(request.partnerId || "")).filter(Boolean));
+  return {
+    total: latest.length,
+    eligiblePartners: uniquePartners.size,
+    requestsSent: latest.length,
+    delivered: count((request) => Boolean(request.deliveredAt)),
+    viewed: count((request) => Boolean(request.viewedAt)),
+    accepted: count((request) => String(request.status || "") === "accepted"),
+    rejected: count((request) => String(request.status || "") === "rejected"),
+    expired: count((request) => String(request.status || "") === "expired"),
+    cancelled: count((request) => String(request.status || "") === "cancelled"),
+    failed: count((request) => String(request.status || "") === "failed"),
+    notResponded: count((request) => effectiveStatus(request) === "not_responded"),
+    assignedPartnerId: booking.partnerId ? String(booking.partnerId) : "",
+    assignedPartnerName: booking.partnerSnapshot?.name || accepted?.partnerSnapshot?.name || "",
+    assignedAt: booking.acceptedAt || accepted?.respondedAt || null,
+    assignmentMethod: booking.partnerId
+      ? (accepted ? "Partner accepted" : "Existing assignment")
+      : "Not assigned"
+  };
+}
+
+function serializePartnerRequest(request, availabilityById = new Map()) {
+  const partnerId = id(request.partnerId);
+  const availability = availabilityById.get(partnerId);
+  const sentAt = request.sentAt || request.createdAt || null;
+  const respondedAt = request.respondedAt || null;
+  const responseTimeSeconds = Number.isFinite(Number(request.responseTimeSeconds))
+    ? Number(request.responseTimeSeconds)
+    : secondsBetween(sentAt, respondedAt);
+  return {
+    requestId: request.requestId || "",
+    partnerId,
+    partnerPublicId: request.partnerPublicId || availability?.partnerCode || "",
+    partner: {
+      name: request.partnerSnapshot?.name || availability?.name || "Partner",
+      photoUrl: request.partnerSnapshot?.photoUrl || availability?.photoUrl || "",
+      phone: request.partnerSnapshot?.phone || availability?.phone || "",
+      serviceCategory: request.partnerSnapshot?.serviceCategory || availability?.serviceCategory || "",
+      rating: Number(request.partnerSnapshot?.rating || availability?.rating || 0),
+      totalJobs: Number(request.partnerSnapshot?.totalJobs || availability?.totalJobs || 0),
+      availability: availability
+        ? (availability.isOnline && availability.accountStatus === "active" && availability.isVerified ? "Online" : "Offline")
+        : (request.partnerSnapshot?.wasOnline ? "Availability unavailable" : "Offline")
+    },
+    routing: request.routing || {},
+    source: request.source || "automatic",
+    dispatchAttempt: Number(request.dispatchAttempt || 1),
+    dispatchStage: Number(request.dispatchStage || 1),
+    status: effectiveStatus(request),
+    rawStatus: request.status || "requested",
+    createdAt: iso(request.createdAt),
+    sentAt: iso(sentAt),
+    deliveredAt: iso(request.deliveredAt),
+    viewedAt: iso(request.viewedAt),
+    respondedAt: iso(respondedAt),
+    expiresAt: iso(request.expiresAt),
+    expiredAt: iso(request.expiredAt),
+    cancelledAt: iso(request.cancelledAt),
+    failedAt: iso(request.failedAt),
+    responseTimeSeconds,
+    rejectionReason: request.rejectionReason || "",
+    failureReason: request.failureReason || "",
+    failureTechnicalDetails: request.failureTechnicalDetails || request.notification?.technicalDetails || "",
+    expiryReason: request.expiryReason || "",
+    cancellationReason: request.cancellationReason || "",
+    notification: {
+      notificationId: request.notification?.notificationId || "",
+      pushStatus: request.notification?.pushStatus || "pending",
+      pushSuccessCount: Number(request.notification?.pushSuccessCount || 0),
+      pushFailureCount: Number(request.notification?.pushFailureCount || 0)
+    }
+  };
+}
+
+function serializeBookingHistory(booking, payments = [], messages = [], availabilityById = new Map()) {
+  booking = decryptAdminRecord(booking);
+  const completedAt = booking.completedAt || bookingTime(booking, ["completed"]);
+  const finalServiceCost = money(booking.finalAmount);
+  const proposedServiceCost = finalServiceCost > 0 ? 0 : money(booking.quoteAmount);
+  const estimatedServiceCost = money(booking.price);
+  return {
+    id: id(booking._id),
+    bookingId: booking.bookingId || booking.publicId || booking.bookingCode || "",
+    serviceCategory: booking.serviceCategory || "",
+    serviceName: booking.serviceName || "",
+    dateTimeBooked: iso(booking.createdAt),
+    scheduledDateTime: booking.slot || iso(booking.expectedArrivalAt),
+    jobStartTime: iso(bookingTime(booking, ["started"])),
+    jobCompletionTime: iso(completedAt),
+    bookingStatus: booking.status || "",
+    assignedPartnerName: booking.partnerSnapshot?.name || "",
+    assignedPartnerMobileNumber: booking.partnerSnapshot?.phone || "",
+    customerAddress: booking.address || "",
+    customerPrimaryPhone: booking.contact?.primaryPhone || booking.userSnapshot?.phone || "",
+    customerAlternatePhone: booking.contact?.alternatePhone || "",
+    addressDetails: booking.addressDetails || {},
+    location: coordinates(booking.location),
+    locationVersion: Number(booking.locationVersion || 1),
+    locationUpdatedAt: iso(booking.locationUpdatedAt || booking.updatedAt),
+    locationUpdatedBy: booking.locationUpdatedBy || "",
+    locationChange: booking.locationChange || {},
+    customerNotes: [booking.issue || "", booking.emergency?.notes || ""].filter(Boolean).join(" | "),
+    finalServiceCost,
+    proposedServiceCost,
+    estimatedServiceCost,
+    paymentStatus: booking.paymentStatus || "",
+    partnerRequests: (booking.partnerRequests || []).map((request) => serializePartnerRequest(request, availabilityById)),
+    partnerRequestSummary: partnerRequestSummary(booking.partnerRequests || [], booking),
+    timeline: bookingTimeline(booking, payments, messages)
+  };
+}
+
+function serializeSupportTicket(ticket) {
+  ticket = decryptAdminRecord(ticket);
+  const conversation = ticket.conversation || [];
+  const lastMessage = conversation.length ? conversation[conversation.length - 1] : null;
+  const publicTicketId = ticket.publicId || (/^(ios-|local-)/i.test(ticket.ticketCode || "") ? "" : ticket.ticketCode) || "";
+  const publicBookingCode = /^(ios-|local-)/i.test(ticket.bookingCode || "") ? "" : (ticket.bookingCode || "");
+  return {
+    id: id(ticket._id),
+    ticketId: publicTicketId,
+    complaintId: publicTicketId,
+    bookingId: ticket.bookingId ? id(ticket.bookingId) : "",
+    bookingCode: publicBookingCode,
+    userName: ticket.userName || "",
+    partnerName: ticket.partnerName || "",
+    mobileNumber: ticket.mobileNumber || "",
+    email: ticket.email || "",
+    ticketCategory: ticket.category || "general",
+    priority: ticket.priority || "normal",
+    status: ticket.status || "open",
+    source: ticket.source || "ai_support",
+    createdDateTime: iso(ticket.createdAt),
+    lastUpdated: iso(ticket.lastUpdatedAt || ticket.updatedAt),
+    lastMessage: lastMessage?.message || ticket.complaint || "",
+    lastMessageAt: iso(lastMessage?.createdAt || ticket.lastUpdatedAt || ticket.updatedAt),
+    complaint: ticket.complaint || "",
+    aiSummary: ticket.aiSummary || "",
+    conversationHistory: conversation.map((entry) => ({
+      id: id(entry._id),
+      senderRole: entry.senderRole || "",
+      senderName: entry.senderName || "",
+      message: entry.message || "",
+      attachments: entry.attachments || [],
+      createdAt: iso(entry.createdAt)
+    })),
+    ticketTimeline: (ticket.timeline || []).map((entry) => ({
+      event: entry.event || "",
+      by: entry.by || "",
+      note: entry.note || "",
+      at: iso(entry.at)
+    })),
+    adminReplies: (ticket.adminReplies || []).map((entry) => ({
+      id: id(entry._id),
+      senderRole: entry.senderRole || "admin",
+      senderName: entry.senderName || "",
+      message: entry.message || "",
+      attachments: entry.attachments || [],
+      createdAt: iso(entry.createdAt)
+    })),
+    resolutionNotes: ticket.resolutionNotes || "",
+    internalNotes: (ticket.internalNotes || []).map((entry) => ({
+      id: id(entry._id),
+      note: entry.note || "",
+      addedBy: entry.addedBy || "",
+      addedAt: iso(entry.addedAt)
+    })),
+    attachments: ticket.attachments || [],
+    assignedTo: ticket.assignedTo || "",
+    escalatedTo: ticket.escalatedTo || "",
+    unreadCount: Number(ticket.adminUnreadCount || 0),
+    userUnreadCount: Number(ticket.userUnreadCount || 0)
+  };
+}
+
+function serializePayment(payment) {
+  payment = decryptAdminRecord(payment);
+  return {
+    paymentId: payment.publicId || "",
+    amount: money(payment.amount),
+    currency: payment.currency || "INR",
+    status: payment.status || "",
+    providerReference: payment.razorpayPaymentId || payment.razorpayOrderId || "",
+    createdAt: iso(payment.createdAt),
+    updatedAt: iso(payment.updatedAt)
+  };
+}
+
+function serializeAdminActivity(activity) {
+  return {
+    id: id(activity._id),
+    eventName: activity.eventName || "",
+    category: activity.category || "",
+    title: activity.title || "",
+    detail: activity.detail || "",
+    bookingId: id(activity.bookingId),
+    bookingCode: activity.bookingCode || "",
+    userId: id(activity.userId),
+    partnerId: id(activity.partnerId),
+    ticketId: activity.ticketId || "",
+    complaintId: activity.complaintId || "",
+    status: activity.status || "",
+    amount: money(activity.amount),
+    actorRole: activity.actorRole || "",
+    actorName: activity.actorName || "",
+    source: activity.source || "",
+    payload: activity.payload || {},
+    createdAt: iso(activity.createdAt),
+    updatedAt: iso(activity.updatedAt)
+  };
+}
+
+function serializeDispute(dispute) {
+  return {
+    id: String(dispute._id),
+    reviewId: String(dispute.reviewId),
+    bookingId: String(dispute.bookingId),
+    bookingCode: dispute.bookingCode || "",
+    partnerId: String(dispute.partnerId),
+    userId: String(dispute.userId),
+    reason: dispute.reason,
+    details: dispute.details || "",
+    status: dispute.status,
+    resolutionNote: dispute.resolutionNote || "",
+    resolvedBy: dispute.resolvedBy || "",
+    createdAt: dispute.createdAt ? dispute.createdAt.toISOString() : "",
+    resolvedAt: dispute.resolvedAt ? dispute.resolvedAt.toISOString() : ""
+  };
+}
+
+function startOfToday() {
+  const value = new Date();
+  value.setHours(0, 0, 0, 0);
+  return value;
+}
+
+function bookingAmount(booking) {
+  return money(booking?.finalAmount);
+}
+
+function safeLimit(value, fallback = 100, maximum = 250) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+  return Math.min(parsed, maximum);
+}
+
+function numericField(path) {
+  return { $convert: { input: path, to: "double", onError: 0, onNull: 0 } };
+}
+
+function bookingAmountExpression() {
+  const finalAmount = numericField("$finalAmount");
+  const quoteAmount = numericField("$quoteAmount");
+  const price = numericField("$price");
+  return {
+    $switch: {
+      branches: [
+        { case: { $gt: [finalAmount, 0] }, then: finalAmount },
+        { case: { $gt: [quoteAmount, 0] }, then: quoteAmount }
+      ],
+      default: price
+    }
+  };
+}
+
+async function paymentSummaryTotals() {
+  const [summary] = await Payment.aggregate([
+    {
+      $group: {
+        _id: null,
+        totalCollection: { $sum: numericField("$amount") },
+        totalRevenue: {
+          $sum: { $cond: [{ $eq: ["$status", "paid"] }, numericField("$amount"), 0] }
+        },
+        pendingPayments: {
+          $sum: { $cond: [{ $in: ["$status", ["created", "failed"]] }, numericField("$amount"), 0] }
+        },
+        totalTransactions: { $sum: 1 }
+      }
+    }
+  ]);
+  return {
+    totalCollection: money(summary?.totalCollection),
+    totalRevenue: money(summary?.totalRevenue),
+    pendingPayments: money(summary?.pendingPayments),
+    totalTransactions: Number(summary?.totalTransactions || 0)
+  };
+}
+
+async function bookingSummaryTotals() {
+  const [summary] = await Booking.aggregate([
+    {
+      $match: {
+        status: { $in: ["completed", "amount_pending"] }
+      }
+    },
+    { $project: { status: 1, paymentStatus: 1, amount: bookingAmountExpression() } },
+    {
+      $group: {
+        _id: null,
+        totalCollection: { $sum: "$amount" },
+        totalRevenue: {
+          $sum: {
+            $cond: [
+              { $or: [{ $eq: ["$status", "completed"] }, { $eq: ["$paymentStatus", "paid"] }] },
+              "$amount",
+              0
+            ]
+          }
+        },
+        pendingPayments: {
+          $sum: {
+            $cond: [
+              { $or: [{ $eq: ["$status", "amount_pending"] }, { $eq: ["$paymentStatus", "pending"] }] },
+              "$amount",
+              0
+            ]
+          }
+        }
+      }
+    }
+  ]);
+  return {
+    totalCollection: money(summary?.totalCollection),
+    totalRevenue: money(summary?.totalRevenue),
+    pendingPayments: money(summary?.pendingPayments)
+  };
+}
+
+function bookingRow(booking) {
+  booking = decryptAdminRecord(booking);
+  // The number entered for this booking is authoritative. The account
+  // snapshot can be older (or belong to a subsequently deleted profile), so
+  // it is only a legacy fallback for rows created before booking contacts.
+  const customerPhone = booking.contact?.primaryPhone
+    || booking.userSnapshot?.phone
+    || booking.customerVerification?.authPhone
+    || "";
+  return {
+    id: booking.bookingId || booking.publicId || booking.bookingCode || "",
+    bookingCode: booking.bookingId || booking.publicId || booking.bookingCode || "",
+    internalBookingCode: booking.bookingCode || "",
+    userName: booking.userSnapshot?.name || "",
+    userMobile: customerPhone,
+    customerPhone,
+    primaryPhone: customerPhone,
+    alternatePhone: booking.contact?.alternatePhone || "",
+    serviceCategory: booking.serviceCategory || "",
+    serviceName: booking.serviceName || booking.serviceCategory || "",
+    partnerName: booking.partnerSnapshot?.name || "",
+    partnerMobile: booking.partnerSnapshot?.phone || "",
+    bookingDateTime: iso(booking.createdAt),
+    scheduledDateTime: booking.slot || iso(booking.expectedArrivalAt),
+    jobStartTime: iso(bookingTime(booking, ["started"])),
+    jobCompletionTime: iso(booking.completedAt || bookingTime(booking, ["completed"])),
+    status: booking.status || "",
+    customerAddress: booking.address || "",
+    locationVersion: Number(booking.locationVersion || 1),
+    locationUpdatedAt: iso(booking.locationUpdatedAt || booking.updatedAt),
+    customerNotes: [booking.issue || "", booking.emergency?.notes || ""].filter(Boolean).join(" | "),
+    finalServiceCost: bookingAmount(booking),
+    paymentStatus: booking.paymentStatus || "",
+    city: booking.city || ""
+  };
+}
+
+function laundryBusinessView(partner) {
+  const business = partner?.laundryBusiness;
+  if (!business) return null;
+  return {
+    shopName: business.shopName || "",
+    shopLicenseNumber: business.shopLicenseNumber || "",
+    shopLocation: business.shopLocation || "",
+    ownerName: business.ownerName || "",
+    ownerPhone: business.ownerPhone || "",
+    staffMembers: (business.staffMembers || []).map((staff) => ({
+      sequence: Number(staff.sequence || 0),
+      name: staff.name || "",
+      phone: staff.phone || "",
+      role: staff.role || "Laundry Staff",
+      photoUrl: staff.photoUrl || "",
+      verificationStatus: staff.verificationStatus || "pending_review",
+      isOnline: Boolean(staff.isOnline),
+      lastLoginAt: iso(staff.lastLoginAt),
+      idNumber: staff.idNumber || "",
+      idType: staff.idType || "",
+      documentType: staff.documentType || "",
+      documentTitle: staff.documentTitle || ""
+    }))
+  };
+}
+
+function partnerRow(partner, bookingCount = 0, profilePhoto = "") {
+  partner = decryptAdminRecord(partner);
+  const approved = partner.isVerified === true && partner.kycStatus === "verified" && partner.trustStatus === "trusted";
+  const blocked = partner.accountStatus === "blocked" || partner.accountStatus === "suspended" || partner.trustStatus === "suspended";
+  const partnerLocation = coordinates(partner.location);
+  return {
+    id: id(partner._id),
+    code: partner.publicId || partner.partnerCode || "",
+    partnerCode: partner.publicId || partner.partnerCode || "",
+    name: partner.name || "",
+    phone: partner.phone || "",
+    email: partner.email || "",
+    profilePhoto: profilePhoto || partner.photoUrl || partner.selfieUrl || "",
+    dateOfBirth: partner.dateOfBirth || "",
+    gender: partner.gender || "",
+    residentialAddress: partner.residentialAddress || "",
+    services: (partner.serviceCategory || []).join(", "),
+    profession: (partner.serviceCategory || []).join(", "),
+    yearsOfExperience: Number(partner.yearsOfExperience || 0),
+    workingAreas: (partner.workingAreas || []).join(", ") || partner.serviceArea || "",
+    languagesKnown: (partner.languagesKnown || []).join(", "),
+    city: partner.city || "",
+    location: partnerLocation.lat || partnerLocation.lng ? `${partnerLocation.lat.toFixed(5)}, ${partnerLocation.lng.toFixed(5)}` : "Location not available",
+    mapUrl: partnerLocation.lat || partnerLocation.lng ? `https://www.google.com/maps?q=${partnerLocation.lat},${partnerLocation.lng}` : "",
+    state: partner.state || "",
+    pinCode: partner.pinCode || "",
+    emergencyContactNumber: partner.emergencyContactNumber || "",
+    serviceArea: partner.serviceArea || "",
+    businessType: partner.businessType || "",
+    businessVerificationStatus: partner.businessVerificationStatus || "not_required",
+    laundryBusiness: laundryBusinessView(partner),
+    online: Boolean(partner.isOnline),
+    totalBookings: bookingCount,
+    approval: blocked ? "Blocked" : (approved ? "Approved" : (partner.kycStatus === "rejected" ? "Denied" : "Waiting Approval")),
+    isVerified: Boolean(partner.isVerified),
+    kyc: partner.kycStatus || "",
+    trust: partner.trustStatus || "",
+    status: blocked ? "blocked" : (partner.accountStatus || "active"),
+    rating: Number(partner.rating || 0),
+    ratingCount: Number(partner.ratingCount || 0),
+    approvalVersion: Number(partner.approvalVersion || 0),
+    approvedAt: iso(partner.approvedAt),
+    rejectedAt: iso(partner.rejectedAt),
+    rejectionReason: partner.rejectionReason || "",
+    joinedAt: iso(partner.createdAt)
+  };
+}
+
+function deviceRowsForOwner(owner, ownerType) {
+  owner = decryptAdminRecord(owner);
+  const ownerId = id(owner?._id);
+  const ownerName = owner?.name || (ownerType === "partner" ? "ApnaServo Partner" : "ApnaServo Customer");
+  const ownerPhone = owner?.phone || "";
+  const ownerEmail = owner?.email || "";
+  const rows = [];
+  const seenTokens = new Set();
+  for (const device of owner?.deviceTokens || []) {
+    if (device?.token) seenTokens.add(String(device.token));
+    if (!device?.isActive) continue;
+    const deviceId = id(device._id) || device.deviceId || device.tokenHash || "";
+    rows.push({
+      id: `${ownerType}:${ownerId}:${deviceId}`,
+      ownerType,
+      ownerId,
+      ownerName,
+      mobileNumber: ownerPhone,
+      email: ownerEmail,
+      platform: device.platform || "android",
+      appType: device.appType || ownerType,
+      deviceId: device.publicId || "",
+      tokenHash: device.tokenHash || (device.token ? tokenHash(device.token) : ""),
+      status: "active",
+      active: Boolean(device.isActive),
+      createdAt: iso(device.createdAt),
+      lastUpdatedAt: iso(device.lastUpdatedAt)
+    });
+  }
+  if (owner?.fcmToken && !seenTokens.has(String(owner.fcmToken))) {
+    rows.push({
+      id: `${ownerType}:${ownerId}:legacy`,
+      ownerType,
+      ownerId,
+      ownerName,
+      mobileNumber: ownerPhone,
+      email: ownerEmail,
+      platform: "android",
+      appType: ownerType,
+      deviceId: owner.legacyDevicePublicId || "",
+      tokenHash: tokenHash(owner.fcmToken),
+      status: "active",
+      active: true,
+      createdAt: "",
+      lastUpdatedAt: ""
+    });
+  }
+  return rows;
+}
+
+async function deactivateAdminDevice(targetId) {
+  const [ownerType, ownerId, deviceIdentifier] = String(targetId || "").split(":");
+  if (!["user", "partner"].includes(ownerType) || !objectId(ownerId) || !deviceIdentifier) {
+    const error = new Error("Invalid device target");
+    error.status = 400;
+    throw error;
+  }
+  const Model = ownerType === "partner" ? Partner : User;
+  const owner = await Model.findById(ownerId);
+  if (!owner) {
+    const error = new Error(`${ownerType === "partner" ? "Partner" : "User"} not found`);
+    error.status = 404;
+    throw error;
+  }
+  let removed = false;
+  if (deviceIdentifier === "legacy") {
+    removed = Boolean(owner.fcmToken);
+    owner.fcmToken = "";
+  } else {
+    for (const device of owner.deviceTokens || []) {
+      if (
+        id(device._id) === deviceIdentifier
+        || String(device.deviceId || "") === deviceIdentifier
+        || String(device.tokenHash || "") === deviceIdentifier
+      ) {
+        device.isActive = false;
+        device.lastUpdatedAt = new Date();
+        if (owner.fcmToken && (String(owner.fcmToken) === String(device.token || "") || tokenHash(owner.fcmToken) === String(device.tokenHash || ""))) {
+          owner.fcmToken = "";
+        }
+        removed = true;
+      }
+    }
+  }
+  if (!removed) {
+    const error = new Error("Device not found or already deleted");
+    error.status = 404;
+    throw error;
+  }
+  await owner.save();
+  return {
+    ownerType,
+    ownerId,
+    ownerName: owner.name || "",
+    deviceIdentifier
+  };
+}
+
+function partnerNotificationRecipient(partner) {
+  if (!partner) return null;
+  const tokens = activeDeviceTokens(partner, "partner").map((device) => device.token);
+  return {
+    role: "partner",
+    partnerId: partner._id,
+    firebaseUid: partner.firebaseUid,
+    token: tokens[0] || partner.fcmToken,
+    tokens,
+    phone: partner.phone
+  };
+}
+
+function userNotificationRecipient(user) {
+  if (!user) return null;
+  const tokens = activeDeviceTokens(user, "user").map((device) => device.token);
+  return {
+    role: "user",
+    userId: user._id,
+    firebaseUid: user.firebaseUid,
+    token: tokens[0] || user.fcmToken,
+    tokens,
+    phone: user.phone
+  };
+}
+
+function approvedPartnerFilter(extra = {}) {
+  return {
+    accountStatus: "active",
+    isVerified: true,
+    kycStatus: "verified",
+    trustStatus: "trusted",
+    ...extra
+  };
+}
+
+function smartPriority(booking) {
+  if (booking.emergency?.isEmergency || booking.emergency?.priority === "critical") return "High Priority";
+  const createdAt = booking.createdAt ? new Date(booking.createdAt).getTime() : Date.now();
+  const ageHours = (Date.now() - createdAt) / (60 * 60 * 1000);
+  if (ageHours >= 4) return "High Priority";
+  if (ageHours >= 1) return "Medium Priority";
+  return "Low Priority";
+}
+
+function ageLabel(value) {
+  const time = value ? new Date(value).getTime() : Date.now();
+  const minutes = Math.max(0, Math.floor((Date.now() - time) / 60000));
+  if (minutes < 1) return "Just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+function smartStatus(booking) {
+  if (booking.partnerId) return "Assigned";
+  if ((booking.requestedPartners || []).length) return "Sent to Partner";
+  return "No Partner";
+}
+
+function smartBookingRow(booking) {
+  return {
+    id: id(booking._id),
+    bookingCode: booking.bookingId || booking.publicId || booking.bookingCode || id(booking._id),
+    customerName: booking.userSnapshot?.name || "Customer",
+    customerMobile: booking.userSnapshot?.phone || "",
+    serviceCategory: booking.serviceCategory || "",
+    serviceName: booking.serviceName || serviceLabel(booking.serviceCategory),
+    area: booking.city || "Guwahati",
+    address: booking.address || "",
+    bookingDateTime: iso(booking.createdAt),
+    scheduledDateTime: booking.slot || iso(booking.expectedArrivalAt),
+    timeAgo: ageLabel(booking.createdAt),
+    priority: smartPriority(booking),
+    status: smartStatus(booking),
+    rawStatus: booking.status || "",
+    partnerName: booking.partnerSnapshot?.name || "",
+    requestedPartnersCount: (booking.requestedPartners || []).length,
+    finalServiceCost: bookingAmount(booking),
+    paymentStatus: booking.paymentStatus || ""
+  };
+}
+
+function smartPartnerRow(partner, activeJobs = 0) {
+  return {
+    id: id(partner._id),
+    partnerCode: partner.partnerCode || id(partner._id),
+    name: partner.name || "ApnaServo Partner",
+    phone: partner.phone || "",
+    email: partner.email || "",
+    serviceCategory: (partner.serviceCategory || []).join(", "),
+    serviceLabel: (partner.serviceCategory || []).map(serviceLabel).join(", "),
+    area: partner.serviceArea || partner.city || "Guwahati",
+    city: partner.city || "",
+    rating: Number(partner.rating || 0),
+    ratingCount: Number(partner.ratingCount || 0),
+    totalJobs: Number(partner.totalJobs || 0),
+    activeJobs,
+    isOnline: Boolean(partner.isOnline),
+    status: partner.isOnline ? "Available" : "Offline",
+    verificationStatus: partner.isVerified && partner.kycStatus === "verified" && partner.trustStatus === "trusted" ? "Verified" : "Review",
+    photoUrl: partner.photoUrl || "",
+    joinedAt: iso(partner.createdAt)
+  };
+}
+
+function smartComplaintRow(ticket) {
+  return {
+    id: id(ticket._id),
+    ticketId: ticket.ticketCode || id(ticket._id),
+    bookingId: id(ticket.bookingId),
+    bookingCode: ticket.bookingCode || "",
+    customerName: ticket.userName || ticket.partnerName || "Customer",
+    mobileNumber: ticket.mobileNumber || "",
+    category: ticket.category || "complaint",
+    priority: ticket.priority || "normal",
+    status: ticket.status || "open",
+    createdAt: iso(ticket.createdAt),
+    lastUpdated: iso(ticket.lastUpdatedAt || ticket.updatedAt),
+    complaint: ticket.complaint || ""
+  };
+}
+
+function smartRebookingRow(request) {
+  return {
+    id: id(request._id),
+    bookingId: id(request.bookingId),
+    bookingCode: request.bookingCode || "",
+    partnerId: id(request.partnerId),
+    status: request.status || "",
+    reason: request.reason || "",
+    message: request.message || "",
+    requestedAt: iso(request.requestedAt || request.createdAt)
+  };
+}
+
+async function activeJobCountByPartner(partnerIds) {
+  if (!partnerIds.length) return new Map();
+  const rows = await Booking.aggregate([
+    { $match: { partnerId: { $in: partnerIds }, status: { $in: ["accepted", "on_the_way", "arrived", "started", "amount_pending"] } } },
+    { $group: { _id: "$partnerId", total: { $sum: 1 } } }
+  ]);
+  return new Map(rows.map((entry) => [id(entry._id), Number(entry.total || 0)]));
+}
+
+function bookingCoordinates(booking) {
+  return coordinates(booking.location);
+}
+
+async function availablePartnersForBooking(booking, { partnerIds = [], onlineOnly = false, limit = 30 } = {}) {
+  const ids = (Array.isArray(partnerIds) ? partnerIds : [])
+    .map((value) => objectId(value))
+    .filter(Boolean);
+  const categories = serviceCategoryVariants(booking.serviceCategory);
+  if (ids.length) {
+    // Admin selection is still category-safe: a Laundry company cannot be
+    // manually sent a Cleaning/AC/Plumbing booking and vice versa.
+    const selected = await Partner.find({ _id: { $in: ids }, serviceCategory: { $in: categories }, ...approvedPartnerFilter() }).limit(limit);
+    return selected.filter((partner) => partnerCanServeService(partner, booking.serviceCategory));
+  }
+
+  let partners = [];
+  if (onlineOnly) {
+    const { lat, lng } = bookingCoordinates(booking);
+    partners = await findNearbyPartners({
+      serviceCategory: booking.serviceCategory,
+      city: booking.city,
+      lat,
+      lng
+    });
+  }
+
+  if (partners.length) return partners.slice(0, limit);
+
+  const cityMatcher = regex(booking.city || "Guwahati");
+  const fallback = await Partner.find({
+    ...approvedPartnerFilter(onlineOnly ? { isOnline: true } : {}),
+    serviceCategory: { $in: categories },
+    ...(cityMatcher ? { $or: [{ city: cityMatcher }, { serviceArea: cityMatcher }, { workingAreas: cityMatcher }] } : {})
+  })
+    .sort({ isOnline: -1, rating: -1, totalJobs: -1, updatedAt: -1 })
+    .limit(limit * 3);
+  return fallback.filter((partner) => partnerCanServeService(partner, booking.serviceCategory)).slice(0, limit);
+}
+
+async function smartAssignmentDashboard(req, res, next) {
+  try {
+    const search = String(req.query.search || "").trim();
+    const service = String(req.query.service || "").trim();
+    const area = String(req.query.area || "").trim();
+    const serviceFilter = service ? { serviceCategory: { $in: serviceCategoryVariants(service) } } : {};
+    const areaFilter = area ? { city: regex(area) } : {};
+    const searchFilter = search
+      ? {
+        $or: [
+          { bookingId: regex(search) },
+          { bookingCode: regex(search) },
+          { serviceName: regex(search) },
+          { "userSnapshot.name": regex(search) },
+          { "userSnapshot.phone": regex(search) }
+        ]
+      }
+      : {};
+
+    const pendingQuery = {
+      partnerId: null,
+      status: { $in: partnerRequestableStatuses() },
+      ...serviceFilter,
+      ...areaFilter,
+      ...searchFilter
+    };
+
+    const [
+      pendingBookings,
+      pendingBookingsCount,
+      rebookingRequests,
+      rebookingRequestsCount,
+      openComplaints,
+      openComplaintsCount,
+      availablePartners,
+      totalAvailablePartners
+    ] = await Promise.all([
+      Booking.find(pendingQuery).sort({ "emergency.isEmergency": -1, createdAt: 1 }).limit(60),
+      Booking.countDocuments(pendingQuery),
+      RevisitRequest.find({ status: { $in: ["open", "partner_notified", "scheduled"] } }).sort({ createdAt: -1 }).limit(20),
+      RevisitRequest.countDocuments({ status: { $in: ["open", "partner_notified", "scheduled"] } }),
+      SupportTicket.find({ status: { $in: ["open", "assigned", "in_progress", "reopened", "escalated"] } }).sort({ lastUpdatedAt: -1, createdAt: -1 }).limit(30),
+      SupportTicket.countDocuments({ status: { $in: ["open", "assigned", "in_progress", "reopened", "escalated"] } }),
+      Partner.find(approvedPartnerFilter()).sort({ isOnline: -1, rating: -1, updatedAt: -1 }).limit(30),
+      Partner.countDocuments(approvedPartnerFilter({ isOnline: true }))
+    ]);
+
+    const partnerIds = availablePartners.map((partner) => partner._id);
+    const activeCounts = await activeJobCountByPartner(partnerIds);
+    const partnerRows = availablePartners.map((partner) => smartPartnerRow(partner, activeCounts.get(id(partner._id)) || 0));
+    const idlePartnerCount = partnerRows.filter((partner) => partner.isOnline && partner.activeJobs === 0).length;
+
+    return res.json({
+      generatedAt: new Date().toISOString(),
+      metrics: {
+        pendingBookings: pendingBookingsCount,
+        rebookingRequests: rebookingRequestsCount,
+        openComplaints: openComplaintsCount,
+        partnersIdle: idlePartnerCount,
+        partnersAvailable: totalAvailablePartners
+      },
+      pendingBookings: pendingBookings.map(smartBookingRow),
+      partners: partnerRows,
+      rebookingRequests: rebookingRequests.map(smartRebookingRow),
+      complaints: openComplaints.map(smartComplaintRow),
+      escalationRules: [
+        { priority: "High Priority", minutes: 15 },
+        { priority: "Medium Priority", minutes: 30 },
+        { priority: "Low Priority", minutes: 60 }
+      ]
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function forwardBookingToPartners({ booking, partners, reason = "Admin manual assignment", mode = "manual" }) {
+  const now = new Date();
+  const partnerIds = [...new Set(partners.map((partner) => id(partner._id)).filter(Boolean))];
+  if (!partnerIds.length) {
+    return { booking, partnerIds: [], addedPartnerIds: [] };
+  }
+
+  const currentRequested = new Set((booking.requestedPartners || []).map((partnerId) => id(partnerId)));
+  const addedPartnerIds = partnerIds.filter((partnerId) => !currentRequested.has(partnerId));
+  const requestedIds = [...new Set([...currentRequested, ...partnerIds])].map((partnerId) => new mongoose.Types.ObjectId(partnerId));
+  const forwardedPartners = partners.filter((partner) => partnerIds.includes(id(partner._id)));
+
+  booking.requestedPartners = requestedIds;
+  booking.rejectedPartners = (booking.rejectedPartners || []).filter((partnerId) => !partnerIds.includes(id(partnerId)));
+  booking.status = "sent_to_partner";
+  const dispatchedAt = new Date();
+  booking.dispatchedAt = dispatchedAt;
+  booking.requestExpiresAt = partnerRequestExpiresAt(dispatchedAt);
+  const dispatchAttempt = Number(booking.dispatchAttempt || 0) + 1;
+  const coordinates = bookingCoordinates(booking);
+  const distancesMeters = {};
+  if (findNearbyPartners.validCoordinates(coordinates.lat, coordinates.lng)) {
+    for (const partner of forwardedPartners) {
+      const point = partner.location?.coordinates || [];
+      if (findNearbyPartners.validCoordinates(point[1], point[0])) {
+        distancesMeters[id(partner._id)] = Math.round(findNearbyPartners.distanceMeters(coordinates.lat, coordinates.lng, point[1], point[0]));
+      }
+    }
+  }
+  cancelOutstandingRequests(booking, {
+    at: dispatchedAt,
+    reason: "Superseded by an admin routing round"
+  });
+  const partnerRequests = addPartnerRequests(booking, forwardedPartners, {
+    match: { distancesMeters, radiusKm: 0, mode: "admin_selection" },
+    source: ["area", "individual", "bulk"].includes(mode) ? mode : "manual",
+    dispatchAttempt,
+    dispatchStage: dispatchAttempt,
+    sentAt: dispatchedAt,
+    actor: "admin"
+  });
+  booking.dispatchAttempt = dispatchAttempt;
+  booking.statusTimeline.push({ status: mode === "bulk" ? "admin_bulk_forwarded" : "admin_forwarded", at: now, by: "admin" });
+  booking.statusTimeline.push({ status: "sent_to_partner", at: now, by: "admin" });
+  await booking.save();
+
+  emitNewBookingToPartners(booking, forwardedPartners);
+  for (const request of partnerRequests) {
+    emitAdminEvent("booking:partner_request_sent", {
+      bookingId: String(booking._id),
+      bookingCode: booking.bookingCode,
+      userId: String(booking.userId || ""),
+      partnerId: String(request.partnerId || ""),
+      partnerName: request.partnerSnapshot?.name || "Partner",
+      requestId: request.requestId || "",
+      status: request.status || "requested",
+      source: request.source || mode
+    });
+  }
+  emitAdminEvent("booking:admin_forwarded", {
+    ...smartBookingRow(booking),
+    assignedPartnerIds: partnerIds,
+    addedPartnerIds,
+    partnerCount: partnerIds.length,
+    reason,
+    mode
+  });
+
+  const delivery = await reliableNotify({
+    recipients: forwardedPartners.map(partnerNotificationRecipient),
+    title: "Booking assigned by ApnaServo",
+    body: `${booking.serviceName || serviceLabel(booking.serviceCategory)} booking ${booking.bookingCode} is available in ${booking.city || "your area"}. Accept it from the Partner App.`,
+    category: "booking_request",
+    priority: smartPriority(booking).startsWith("High") ? "high" : "normal",
+    data: {
+      type: "booking:admin_forwarded",
+      targetApp: "partner",
+      actionType: "OPEN_BOOKING",
+      bookingId: booking._id,
+      bookingCode: booking.bookingCode,
+      serviceCategory: booking.serviceCategory,
+      mode
+    },
+    smsBody: `ApnaServo: Booking ${booking.bookingCode} for ${booking.serviceName || booking.serviceCategory} is available. Open Partner App to accept.`
+  });
+  const deliveryUpdates = [];
+  for (let index = 0; index < partnerRequests.length; index += 1) {
+    const outcome = recordNotificationResult(booking, partnerRequests[index].requestId, delivery.results[index] || {}, { at: new Date() });
+    if (outcome.changed && outcome.request) deliveryUpdates.push(outcome.request);
+  }
+  if (deliveryUpdates.length) {
+    await booking.save();
+    for (const request of deliveryUpdates) {
+      emitAdminEvent(
+        request.notification?.pushStatus === "sent" ? "booking:partner_request_delivered" : "booking:partner_request_failed",
+        {
+          bookingId: String(booking._id),
+          bookingCode: booking.bookingCode,
+          userId: String(booking.userId || ""),
+          partnerId: String(request.partnerId || ""),
+          partnerName: request.partnerSnapshot?.name || "Partner",
+          requestId: request.requestId || "",
+          status: request.status || "requested",
+          source: request.source || mode
+        }
+      );
+    }
+  }
+
+  const user = await User.findById(booking.userId);
+  await reliableNotify({
+    recipients: [userNotificationRecipient(user)],
+    title: "Partner assignment in progress",
+    body: `We have forwarded booking ${booking.bookingCode} to available partners in your area.`,
+    category: "booking_status",
+    priority: "normal",
+    data: {
+      type: "booking:admin_forwarded",
+      targetApp: "user",
+      actionType: "OPEN_BOOKING",
+      bookingId: booking._id,
+      bookingCode: booking.bookingCode,
+      status: booking.status
+    }
+  });
+
+  return { booking, partnerIds, addedPartnerIds };
+}
+
+async function smartAssignBooking(req, res, next) {
+  try {
+    const bookingId = String(req.body?.bookingId || "").trim();
+    const mode = String(req.body?.mode || "area").trim();
+    const reason = String(req.body?.reason || "Admin smart assignment").trim();
+    const partnerIds = Array.isArray(req.body?.partnerIds) ? req.body.partnerIds : [];
+    if (!bookingId) return res.status(400).json({ message: "bookingId is required" });
+
+    const booking = await Booking.findOne({
+      $or: [
+        { _id: objectId(bookingId) || undefined },
+        { bookingId: bookingId.toUpperCase() },
+        { bookingCode: bookingId },
+        { publicId: bookingId.toUpperCase() }
+      ].filter((entry) => Object.values(entry)[0])
+    });
+    if (!booking) return res.status(404).json({ message: "Booking not found" });
+    if (booking.partnerId) return res.status(409).json({ message: "Booking already has an assigned partner" });
+    if (!partnerRequestableStatuses().includes(String(booking.status || ""))) {
+      return res.status(409).json({ message: `Booking cannot be forwarded while status is ${booking.status}` });
+    }
+
+    const partners = await availablePartnersForBooking(booking, {
+      partnerIds,
+      onlineOnly: mode !== "individual",
+      limit: mode === "individual" ? 10 : 30
+    });
+    if (!partners.length) {
+      return res.status(404).json({ message: "No approved partners found for this booking area/service" });
+    }
+
+    const result = await forwardBookingToPartners({ booking, partners, reason, mode });
+    return res.json({
+      ok: true,
+      booking: smartBookingRow(result.booking),
+      partners: partners.map((partner) => smartPartnerRow(partner)),
+      assignedPartnerIds: result.partnerIds,
+      addedPartnerIds: result.addedPartnerIds
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function smartBulkAssignPending(req, res, next) {
+  try {
+    const limit = safeLimit(req.body?.limit, 25, 50);
+    const service = String(req.body?.service || "").trim();
+    const area = String(req.body?.area || "").trim();
+    const query = {
+      partnerId: null,
+      status: { $in: partnerRequestableStatuses() },
+      ...(service ? { serviceCategory: { $in: serviceCategoryVariants(service) } } : {}),
+      ...(area ? { city: regex(area) } : {})
+    };
+    const bookings = await Booking.find(query).sort({ "emergency.isEmergency": -1, createdAt: 1 }).limit(limit);
+    const results = [];
+
+    for (const booking of bookings) {
+      const partners = await availablePartnersForBooking(booking, { onlineOnly: true, limit: 15 });
+      if (!partners.length) {
+        results.push({ bookingId: id(booking._id), bookingCode: booking.bookingCode, ok: false, message: "No approved online partners found" });
+        continue;
+      }
+      const result = await forwardBookingToPartners({
+        booking,
+        partners,
+        reason: "Admin bulk auto assignment",
+        mode: "bulk"
+      });
+      results.push({
+        bookingId: id(result.booking._id),
+        bookingCode: result.booking.bookingCode,
+        ok: true,
+        partnerCount: result.partnerIds.length,
+        addedPartnerCount: result.addedPartnerIds.length
+      });
+    }
+
+    return res.json({
+      ok: true,
+      processed: results.length,
+      forwarded: results.filter((entry) => entry.ok).length,
+      results
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+function paymentRow(payment) {
+  payment = decryptAdminRecord(payment);
+  return {
+    id: id(payment._id),
+    paymentId: payment.publicId || "",
+    bookingId: id(payment.bookingId?._id || payment.bookingId),
+    bookingCode: payment.bookingId?.bookingCode || "",
+    userName: payment.userId?.name || "",
+    userMobile: payment.userId?.phone || "",
+    partnerName: payment.partnerId?.name || "",
+    partnerMobile: payment.partnerId?.phone || "",
+    amount: money(payment.amount),
+    currency: payment.currency || "INR",
+    status: payment.status || "",
+    razorpayOrderId: payment.razorpayOrderId || "",
+    razorpayPaymentId: payment.razorpayPaymentId || "",
+    createdAt: iso(payment.createdAt),
+    updatedAt: iso(payment.updatedAt)
+  };
+}
+
+async function bookingCountByPartner(partnerIds) {
+  if (!partnerIds.length) return new Map();
+  const counts = await Booking.aggregate([
+    { $match: { partnerId: { $in: partnerIds } } },
+    { $group: { _id: "$partnerId", total: { $sum: 1 } } }
+  ]);
+  return new Map(counts.map((entry) => [id(entry._id), entry.total]));
+}
+
+async function dashboard(req, res, next) {
+  try {
+    const today = startOfToday();
+    const [
+      totalUsers,
+      activeUsers,
+      newUsersToday,
+      totalPartners,
+      activePartners,
+      pendingPartnerApprovals,
+      blockedPartners,
+      totalBookings,
+      completedBookings,
+      cancelledBookings,
+      pendingBookings,
+      processingBookings,
+      openReviewDisputes,
+      resolvedReviewDisputes,
+      openSupportTickets,
+      resolvedSupportTickets,
+      paymentTotals,
+      recentBookings,
+      recentDisputes,
+      recentTickets,
+      recentPayments,
+      recentActivity,
+      bookingTotals
+    ] = await Promise.all([
+      User.countDocuments(),
+      User.countDocuments({ accountStatus: "active" }),
+      User.countDocuments({ createdAt: { $gte: today } }),
+      Partner.countDocuments(),
+      Partner.countDocuments({ accountStatus: "active", trustStatus: { $ne: "suspended" } }),
+      Partner.countDocuments({ kycStatus: { $in: ["missing", "submitted", "pending_review"] } }),
+      Partner.countDocuments({ $or: [{ trustStatus: "suspended" }, { accountStatus: { $ne: "active" } }] }),
+      Booking.countDocuments(),
+      Booking.countDocuments({ status: "completed" }),
+      Booking.countDocuments({ status: { $in: ["cancelled", "canceled"] } }),
+      Booking.countDocuments({ status: { $in: ["pending", "sent_to_partner", "amount_pending"] } }),
+      Booking.countDocuments({ status: { $in: ["accepted", "on_the_way", "arrived", "started"] } }),
+      ReviewDispute.countDocuments({ status: { $in: ["open", "reviewing"] } }),
+      ReviewDispute.countDocuments({ status: { $in: ["accepted", "rejected"] } }),
+      SupportTicket.countDocuments({ status: { $in: ["open", "assigned", "in_progress", "waiting_on_customer", "reopened", "escalated"] } }),
+      SupportTicket.countDocuments({ status: { $in: ["resolved", "closed"] } }),
+      paymentSummaryTotals(),
+      Booking.find().sort({ createdAt: -1 }).limit(8).lean(),
+      ReviewDispute.find().sort({ createdAt: -1 }).limit(6).lean(),
+      SupportTicket.find().sort({ lastUpdatedAt: -1, createdAt: -1 }).limit(6).lean(),
+      Payment.find().sort({ createdAt: -1 }).limit(8).populate("partnerId", "name phone").populate("userId", "name phone").populate("bookingId", "bookingCode serviceName serviceCategory").lean(),
+      AdminActivity.find().sort({ createdAt: -1 }).limit(12).lean(),
+      bookingSummaryTotals()
+    ]);
+
+    const totalRevenue = paymentTotals.totalRevenue || bookingTotals.totalRevenue;
+    const pendingPaymentAmount = paymentTotals.pendingPayments || bookingTotals.pendingPayments;
+    const totalCollection = paymentTotals.totalCollection || bookingTotals.totalCollection;
+    const platformCommission = Math.round(totalRevenue * 0.12);
+    const partnerEarnings = Math.max(totalRevenue - platformCommission, 0);
+    const recentComplaints = [
+      ...recentDisputes.map((entry) => ({
+        id: id(entry._id),
+        complaintId: entry.bookingCode || id(entry._id),
+        userName: "",
+        type: entry.reason || "review_dispute",
+        status: entry.status || "",
+        createdAt: iso(entry.createdAt),
+        source: "review_dispute"
+      })),
+      ...recentTickets.map((entry) => ({
+        id: id(entry._id),
+        complaintId: entry.ticketCode || id(entry._id),
+        userName: entry.userName || "",
+        type: entry.category || "support",
+        status: entry.status || "",
+        createdAt: iso(entry.createdAt),
+        source: "support_ticket"
+      }))
+    ].sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()).slice(0, 8);
+
+    const payload = {
+      generatedAt: new Date().toISOString(),
+      analytics: {
+        totalUsers,
+        activeUsers,
+        newUsersToday,
+        totalPartners,
+        activePartners,
+        pendingPartnerApprovals,
+        blockedPartners,
+        totalBookings,
+        completedBookings,
+        cancelledBookings,
+        pendingBookings,
+        processingBookings,
+        openComplaints: openReviewDisputes + openSupportTickets,
+        resolvedComplaints: resolvedReviewDisputes + resolvedSupportTickets,
+        totalRevenue,
+        totalCollection,
+        partnerEarnings,
+        platformCommission,
+        pendingPaymentAmount,
+        totalTransactions: paymentTotals.totalTransactions
+      },
+      bookingStatusBreakdown: [
+        { status: "Completed", value: completedBookings },
+        { status: "Pending", value: pendingBookings },
+        { status: "Cancelled", value: cancelledBookings },
+        { status: "Processing", value: processingBookings }
+      ],
+      recentBookings: recentBookings.map(bookingRow),
+      recentComplaints,
+      recentPayments: recentPayments.map(paymentRow),
+      recentActivity: recentActivity.map(serializeAdminActivity),
+      paymentsSummary: {
+        totalCollection,
+        partnerEarnings,
+        platformCommission,
+        pendingPaymentAmount
+      }
+    };
+    return res.json(payload);
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function listAdminActivity(req, res, next) {
+  try {
+    const limit = safeLimit(req.query.limit, 80, 250);
+    const query = {};
+    const eventName = String(req.query.eventName || "").trim();
+    const category = String(req.query.category || "").trim();
+    const status = String(req.query.status || "").trim();
+    const bookingId = String(req.query.bookingId || "").trim();
+    const userId = objectId(req.query.userId);
+    const partnerId = objectId(req.query.partnerId);
+    const ticketId = String(req.query.ticketId || "").trim();
+
+    if (eventName) query.eventName = eventName;
+    if (category) query.category = category;
+    if (status) query.status = status;
+    if (bookingId) {
+      const bookingObjectId = objectId(bookingId);
+      query.$or = [
+        ...(bookingObjectId ? [{ bookingId: bookingObjectId }] : []),
+        { bookingCode: bookingId }
+      ];
+    }
+    if (userId) query.userId = userId;
+    if (partnerId) query.partnerId = partnerId;
+    if (ticketId) query.ticketId = ticketId;
+
+    const activity = await AdminActivity.find(query).sort({ createdAt: -1 }).limit(limit);
+    return res.json({
+      generatedAt: new Date().toISOString(),
+      activity: activity.map(serializeAdminActivity)
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+// Customer apps that support service analytics send `user:service_clicked`.
+// This endpoint is deliberately derived from the immutable activity ledger so
+// an admin can see real interest even for services that are unavailable,
+// preparing, or high demand and therefore never become bookings.
+async function serviceInterestAnalytics(req, res, next) {
+  try {
+    const requestedDays = Number(req.query.days || 30);
+    const days = Number.isFinite(requestedDays) ? Math.min(90, Math.max(1, Math.trunc(requestedDays))) : 30;
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const serviceQuery = String(req.query.service || "").trim().toLowerCase();
+    const serviceSearch = regex(serviceQuery);
+    const platform = String(req.query.platform || "all").trim().toLowerCase();
+    const match = { eventName: "user:service_clicked", createdAt: { $gte: since } };
+    if (platform === "android" || platform === "ios") match["payload.platform"] = platform;
+    if (serviceSearch) {
+      match.$or = [
+        { "payload.serviceId": serviceSearch },
+        { "payload.serviceName": serviceSearch },
+        { "payload.serviceCategory": serviceSearch },
+      ];
+    }
+
+    const rows = await AdminActivity.aggregate([
+      { $match: match },
+      { $project: {
+        createdAt: 1,
+        userId: 1,
+        actorName: 1,
+        source: 1,
+        serviceId: { $toLower: { $ifNull: ["$payload.serviceId", ""] } },
+        serviceName: { $ifNull: ["$payload.serviceName", ""] },
+        serviceCategory: { $ifNull: ["$payload.serviceCategory", ""] },
+        platform: { $ifNull: ["$payload.platform", "unknown"] },
+      } },
+      { $group: {
+        _id: { serviceId: "$serviceId", serviceName: "$serviceName", serviceCategory: "$serviceCategory" },
+        totalClicks: { $sum: 1 },
+        uniqueUsers: { $addToSet: "$userId" },
+        iosClicks: { $sum: { $cond: [{ $eq: ["$platform", "ios"] }, 1, 0] } },
+        androidClicks: { $sum: { $cond: [{ $eq: ["$platform", "android"] }, 1, 0] } },
+        lastClickedAt: { $max: "$createdAt" },
+      } },
+      { $project: {
+        _id: 0,
+        serviceId: "$_id.serviceId",
+        serviceName: "$_id.serviceName",
+        serviceCategory: "$_id.serviceCategory",
+        totalClicks: 1,
+        uniqueUsers: { $size: "$uniqueUsers" },
+        iosClicks: 1,
+        androidClicks: 1,
+        lastClickedAt: 1,
+      } },
+      { $sort: { totalClicks: -1, lastClickedAt: -1 } },
+      { $limit: 100 },
+    ]);
+
+    const recent = await AdminActivity.find(match)
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .lean();
+    const visibleRecent = recent.map((entry) => {
+      const payload = entry.payload || {};
+      return {
+        id: id(entry._id),
+        userId: id(entry.userId),
+        userName: entry.actorName || payload.userName || "Customer",
+        serviceId: payload.serviceId || "",
+        serviceName: payload.serviceName || "",
+        serviceCategory: payload.serviceCategory || "",
+        platform: payload.platform || "unknown",
+        screen: payload.screen || "",
+        clickedAt: iso(entry.createdAt),
+      };
+    });
+    const totals = rows.reduce((sum, row) => sum + Number(row.totalClicks || 0), 0);
+    res.set("Cache-Control", "no-store, max-age=0, must-revalidate");
+    return res.json({
+      generatedAt: new Date().toISOString(),
+      days,
+      since: since.toISOString(),
+      totalClicks: totals,
+      services: rows.map((row) => ({ ...row, lastClickedAt: iso(row.lastClickedAt) })),
+      recentClicks: visibleRecent,
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function createPartner(req, res, next) {
+  let createdFirebaseUid = "";
+  try {
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const name = String(body.name || "").trim();
+    const phone = normalizePartnerPhone(body.phone);
+    const email = normalizePartnerEmail(body.email);
+    const requestedCategories = Array.isArray(body.serviceCategories) ? body.serviceCategories : [body.serviceCategory || "ac"];
+    const allowedCategories = new Set(["ac", "plumbing", "electrician", "carpenter", "painting", "cleaning", "laundry", "interior", "roadside", "appliances", "pest", "ro"]);
+    const city = String(body.city || "Guwahati").trim();
+    const state = String(body.state || "Assam").trim();
+    const serviceArea = String(body.serviceArea || city || "Guwahati").trim();
+    const categories = [...new Set(requestedCategories.map(normalizeServiceCategory).filter((value) => allowedCategories.has(value)))];
+    const category = categories[0] || "";
+    const partnerType = String(body.partnerType || (categories.includes("laundry") ? "LAUNDRY_OWNER" : "SERVICE_PARTNER")).trim().toUpperCase();
+    const status = String(body.status || "ACTIVE").trim().toUpperCase();
+    const approved = body.approved !== false && status === "ACTIVE";
+
+    if (name.length < 2 || name.length > 100) return res.status(400).json({ message: "Partner name must be between 2 and 100 characters." });
+    if (!phone && !email) return res.status(400).json({ message: "Enter a valid mobile number or email address." });
+    if (body.phone && !phone) return res.status(400).json({ message: "Enter a valid 10-digit Indian mobile number." });
+    if (body.email && !email) return res.status(400).json({ message: "Enter a valid email address." });
+    if (!categories.length) return res.status(400).json({ message: "Select at least one valid service category." });
+    if (!["SERVICE_PARTNER", "LAUNDRY_OWNER", "LAUNDRY_PARTNER"].includes(partnerType)) return res.status(400).json({ message: "Select a valid partner type." });
+    if (!["ACTIVE", "INACTIVE", "SUSPENDED"].includes(status)) return res.status(400).json({ message: "Select a valid partner status." });
+
+    const phoneHash = partnerIdentityHash(phone);
+    const emailHash = partnerIdentityHash(email);
+    const duplicateFilters = [];
+    if (phoneHash) duplicateFilters.push({ phoneHash });
+    if (emailHash) duplicateFilters.push({ emailHash });
+    const duplicatePartner = duplicateFilters.length ? await Partner.findOne({ $or: duplicateFilters }).select("_id partnerCode name phone email accountStatus").lean() : null;
+    if (duplicatePartner) {
+      return res.status(409).json({ message: "Partner already exists", existingPartner: { id: id(duplicatePartner._id), partnerCode: duplicatePartner.partnerCode || "", name: duplicatePartner.name, phone: duplicatePartner.phone, email: duplicatePartner.email, status: duplicatePartner.accountStatus } });
+    }
+
+    const firebase = initFirebase();
+    const e164 = phone ? `+91${phone}` : "";
+    let firebaseUser;
+    let phoneUser;
+    let emailUser;
+    if (phone) {
+      try { phoneUser = await firebase.auth().getUserByPhoneNumber(e164); }
+      catch (error) { if (error?.code !== "auth/user-not-found") throw error; }
+    }
+    if (email) {
+      try { emailUser = await firebase.auth().getUserByEmail(email); }
+      catch (error) { if (error?.code !== "auth/user-not-found") throw error; }
+    }
+    if (phoneUser && emailUser && phoneUser.uid !== emailUser.uid) {
+      return res.status(409).json({ message: "Email and phone belong to different authentication accounts. Use one registered identity or link them in Firebase first." });
+    }
+    firebaseUser = phoneUser || emailUser;
+    if (!firebaseUser) {
+      firebaseUser = await firebase.auth().createUser({ ...(phone ? { phoneNumber: e164 } : {}), displayName: name, ...(email ? { email } : {}) });
+      createdFirebaseUid = firebaseUser.uid;
+    } else if ((phone && !firebaseUser.phoneNumber) || (email && !firebaseUser.email) || firebaseUser.displayName !== name) {
+      firebaseUser = await firebase.auth().updateUser(firebaseUser.uid, {
+        ...(phone && !firebaseUser.phoneNumber ? { phoneNumber: e164 } : {}),
+        ...(email && !firebaseUser.email ? { email } : {}),
+        displayName: name
+      });
+    }
+    const uidPartner = await Partner.findOne({ firebaseUid: firebaseUser.uid }).select("_id partnerCode name phone email accountStatus").lean();
+    if (uidPartner) {
+      return res.status(409).json({ message: "Partner already exists", existingPartner: { id: id(uidPartner._id), partnerCode: uidPartner.partnerCode || "", name: uidPartner.name, phone: uidPartner.phone, email: uidPartner.email, status: uidPartner.accountStatus } });
+    }
+
+    const now = new Date();
+    const isLaundry = partnerType !== "SERVICE_PARTNER" || categories.includes("laundry");
+    const partner = await Partner.create({
+      firebaseUid: firebaseUser.uid,
+      name,
+      phone,
+      phoneHash,
+      email,
+      emailHash,
+      serviceCategory: isLaundry ? ["laundry"] : categories,
+      city,
+      state,
+      pinCode: String(body.pinCode || "").trim(),
+      residentialAddress: String(body.residentialAddress || "").trim(),
+      serviceArea,
+      workingAreas: String(body.workingAreas || serviceArea).trim(),
+      yearsOfExperience: Math.max(0, Math.min(60, Number(body.yearsOfExperience || 0))),
+      languagesKnown: String(body.languagesKnown || "").trim(),
+      businessType: isLaundry ? "laundry" : "",
+      businessVerificationStatus: isLaundry ? (approved ? "approved" : "pending_review") : "not_required",
+      ...(isLaundry ? { laundryBusiness: {
+        shopName: String(body.shopName || name).trim(),
+        shopLicenseNumber: String(body.shopLicenseNumber || "").trim(),
+        shopLocation: String(body.shopLocation || serviceArea).trim(),
+        ownerName: name,
+        ownerPhone: phone,
+        staffMembers: []
+      } } : {}),
+      isOnline: false,
+      isVerified: approved,
+      kycStatus: approved ? "verified" : "pending_review",
+      trustStatus: status === "SUSPENDED" ? "suspended" : approved ? "trusted" : "review_required",
+      accountStatus: status === "ACTIVE" ? "active" : status === "INACTIVE" ? "inactive" : "suspended",
+      approvedAt: approved ? now : null,
+      termsConsent: {
+        accepted: true,
+        version: "admin-created-v1",
+        acceptedAt: now,
+        clientAcceptedAt: now,
+        registrationFlow: "admin_manual",
+        serviceCategory: category,
+        documentKey: "partner_terms",
+        sourceApp: "admin_panel",
+        ipAddress: req.ip || "",
+        userAgent: req.get("user-agent") || ""
+      },
+      termsAcceptanceHistory: [{
+        accepted: true,
+        version: "admin-created-v1",
+        acceptedAt: now,
+        clientAcceptedAt: now,
+        registrationFlow: "admin_manual",
+        serviceCategory: category,
+        documentKey: "partner_terms",
+        sourceApp: "admin_panel"
+      }]
+    });
+
+    await cache.del("admin:dashboard:v1");
+    emitAdminEvent("partner:created", { partnerId: id(partner._id), approved, serviceCategory: partner.serviceCategory, partnerType, status: partner.accountStatus });
+    return res.status(201).json({
+      message: approved ? "Partner created and approved." : "Partner created for verification.",
+      partner: { id: id(partner._id), partnerCode: partner.partnerCode || "", name, phone, email, partnerType, serviceCategory: partner.serviceCategory, status: partner.accountStatus, isVerified: partner.isVerified }
+    });
+  } catch (error) {
+    if (createdFirebaseUid) {
+      try {
+        await initFirebase().auth().deleteUser(createdFirebaseUid);
+      } catch (rollbackError) {
+        console.error("Failed to roll back manually-created Firebase partner", rollbackError);
+      }
+    }
+    if (error?.code === 11000) return res.status(409).json({ message: "A partner with this mobile number or email already exists." });
+    return next(error);
+  }
+}
+
+async function listResourceRows(req, res, next) {
+  try {
+    const resource = String(req.params.resource || "").trim().toLowerCase();
+    const limit = safeLimit(req.query.limit, 100, 250);
+    let rows = [];
+    let metrics = {};
+
+    if (resource === "users") {
+      const users = await User.find().sort({ createdAt: -1 }).limit(limit).lean();
+      const userIds = users.map((user) => user._id);
+      const [bookingCounts, disputeCounts, ticketCounts] = userIds.length ? await Promise.all([
+        Booking.aggregate([{ $match: { userId: { $in: userIds } } }, { $group: { _id: "$userId", total: { $sum: 1 } } }]),
+        ReviewDispute.aggregate([{ $match: { userId: { $in: userIds } } }, { $group: { _id: "$userId", total: { $sum: 1 } } }]),
+        SupportTicket.aggregate([{ $match: { userId: { $in: userIds } } }, { $group: { _id: "$userId", total: { $sum: 1 } } }])
+      ]) : [[], [], []];
+      const bookingCountMap = new Map(bookingCounts.map((entry) => [id(entry._id), entry.total]));
+      const disputeCountMap = new Map(disputeCounts.map((entry) => [id(entry._id), entry.total]));
+      const ticketCountMap = new Map(ticketCounts.map((entry) => [id(entry._id), entry.total]));
+      rows = users.map((user) => {
+        const userId = id(user._id);
+        const addressList = savedAddresses(user);
+        return {
+          id: user.publicId || userId,
+          userId: user.publicId || "",
+          fullName: user.name,
+          mobileNumber: user.phone,
+          email: user.email,
+          profilePhoto: user.profilePhotoUrl || "",
+          registrationDateTime: iso(user.createdAt),
+          lastLoginTime: iso(user.lastLoginAt),
+          accountStatus: normalizeAccountStatus(user.accountStatus),
+          totalBookings: bookingCountMap.get(userId) || 0,
+          totalComplaintsRaised: (disputeCountMap.get(userId) || 0) + (ticketCountMap.get(userId) || 0),
+          currentLocation: coordinates(user.location),
+          savedAddresses: addressList,
+          deviceInformation: summarizeDeviceInfo(user.deviceInfo)
+        };
+      });
+      metrics = {
+        totalUsers: await User.countDocuments(),
+        activeUsers: await User.countDocuments({ accountStatus: "active" })
+      };
+    } else if (resource === "partners") {
+      const visiblePartnerFilter = { accountStatus: { $ne: "deleted" } };
+      // Deleted records remain available to admins through the Deleted Partners metric.
+      // The dashboard hides them from the default list and reveals them on demand.
+      const partners = await Partner.find({}).sort({ createdAt: -1 }).limit(limit).lean();
+      const countMap = await bookingCountByPartner(partners.map((partner) => partner._id));
+      const profileMap = await profileDocumentUrlMap(req, partners.map((partner) => partner._id));
+      rows = partners.map((partner) => {
+        const profilePhoto = partner.profilePhotoAssetId
+          ? partnerAssetUrl(req, partner.profilePhotoAssetId)
+          : profileMap.get(id(partner._id)) || "";
+        return partnerRow(partner, countMap.get(id(partner._id)) || 0, profilePhoto);
+      });
+      metrics = {
+        totalPartners: await Partner.countDocuments(visiblePartnerFilter),
+        activePartners: await Partner.countDocuments({ accountStatus: "active", trustStatus: { $ne: "suspended" } }),
+        pendingApproval: await Partner.countDocuments({ ...visiblePartnerFilter, kycStatus: { $in: ["missing", "submitted", "pending_review"] } }),
+        blockedOrSuspended: await Partner.countDocuments({ ...visiblePartnerFilter, $or: [{ trustStatus: "suspended" }, { accountStatus: { $ne: "active" } }] }),
+        deletedPartners: await Partner.countDocuments({ accountStatus: "deleted" }),
+        totalBookings: await Booking.countDocuments({ partnerId: { $ne: null } })
+      };
+    } else if (resource === "devices") {
+      const [users, partners] = await Promise.all([
+        User.find({
+          $or: [
+            { fcmToken: { $nin: ["", null] } },
+            { deviceTokens: { $elemMatch: { isActive: true } } }
+          ]
+        }).sort({ updatedAt: -1 }).limit(limit),
+        Partner.find({
+          $or: [
+            { fcmToken: { $nin: ["", null] } },
+            { deviceTokens: { $elemMatch: { isActive: true } } }
+          ]
+        }).sort({ updatedAt: -1 }).limit(limit)
+      ]);
+      rows = [...users.flatMap((user) => deviceRowsForOwner(user, "user")), ...partners.flatMap((partner) => deviceRowsForOwner(partner, "partner"))]
+        .sort((left, right) => new Date(right.lastUpdatedAt || right.createdAt || 0).getTime() - new Date(left.lastUpdatedAt || left.createdAt || 0).getTime())
+        .slice(0, limit);
+      metrics = {
+        totalDevices: rows.length,
+        userDevices: rows.filter((row) => row.ownerType === "user").length,
+        partnerDevices: rows.filter((row) => row.ownerType === "partner").length,
+        activeDevices: rows.filter((row) => row.active).length
+      };
+    } else if (resource === "partner-approvals") {
+      const pendingPartnerFilter = {
+        kycStatus: { $in: ["missing", "submitted", "pending_review", "rejected"] },
+        accountStatus: "active",
+        trustStatus: { $ne: "suspended" }
+      };
+      const partners = await Partner.find(pendingPartnerFilter).sort({ createdAt: -1 }).limit(limit).lean();
+      const countMap = await bookingCountByPartner(partners.map((partner) => partner._id));
+      const profileMap = await profileDocumentUrlMap(req, partners.map((partner) => partner._id));
+      rows = partners.map((partner) => {
+        const profilePhoto = partner.profilePhotoAssetId
+          ? partnerAssetUrl(req, partner.profilePhotoAssetId)
+          : profileMap.get(id(partner._id)) || "";
+        return partnerRow(partner, countMap.get(id(partner._id)) || 0, profilePhoto);
+      });
+      metrics = {
+        needsAction: await Partner.countDocuments(pendingPartnerFilter),
+        pendingApproval: await Partner.countDocuments({ ...pendingPartnerFilter, kycStatus: { $in: ["missing", "submitted", "pending_review"] } }),
+        submitted: await Partner.countDocuments({ kycStatus: "submitted" }),
+        pendingReview: await Partner.countDocuments({ kycStatus: "pending_review" }),
+        rejected: await Partner.countDocuments({ kycStatus: "rejected" }),
+        verified: await Partner.countDocuments({ kycStatus: "verified" })
+      };
+    } else if (resource === "bookings" || resource === "quotes") {
+      const bookings = await Booking.find().sort({ createdAt: -1 }).limit(limit).lean();
+      rows = bookings.map(bookingRow);
+      const [bookingTotals, totalBookings, completed, pending, cancelled] = await Promise.all([
+        bookingSummaryTotals(),
+        Booking.countDocuments(),
+        Booking.countDocuments({ status: "completed" }),
+        Booking.countDocuments({ status: { $in: ["pending", "sent_to_partner", "amount_pending"] } }),
+        Booking.countDocuments({ status: { $in: ["cancelled", "canceled"] } })
+      ]);
+      metrics = {
+        totalBookings,
+        completed,
+        pending,
+        cancelled,
+        totalRevenue: bookingTotals.totalRevenue,
+        avgOrderValue: completed ? Math.round(bookingTotals.totalRevenue / completed) : 0
+      };
+    } else if (resource === "payments") {
+      const payments = await Payment.find().sort({ createdAt: -1 }).limit(limit).populate("partnerId", "name phone").populate("userId", "name phone").populate("bookingId", "bookingCode serviceName serviceCategory").lean();
+      rows = payments.map(paymentRow);
+      const paymentTotals = await paymentSummaryTotals();
+      metrics = {
+        totalPlatformRevenue: paymentTotals.totalRevenue,
+        totalPartnerEarnings: Math.round(paymentTotals.totalRevenue * 0.88),
+        totalCollection: paymentTotals.totalCollection,
+        pendingPayments: paymentTotals.pendingPayments,
+        overduePayments: 0,
+        totalTransactions: paymentTotals.totalTransactions
+      };
+    } else if (resource === "services") {
+      const services = await Service.find().sort({ createdAt: -1 }).limit(limit);
+      rows = services.map((service) => ({
+        id: id(service._id),
+        name: service.name,
+        category: service.serviceCategory || "",
+        active: service.isActive !== false,
+        status: service.status || "active",
+        createdAt: iso(service.createdAt)
+      }));
+    } else if (resource === "complaints") {
+      const disputes = await ReviewDispute.find().sort({ createdAt: -1 }).limit(limit);
+      const supportTickets = await SupportTicket.find().sort({ createdAt: -1 }).limit(limit);
+      const disputeRows = disputes.map((dispute) => ({
+        id: id(dispute._id),
+        bookingCode: dispute.bookingCode || "",
+        reason: dispute.reason,
+        complaint: dispute.reason,
+        description: dispute.reason,
+        source: "review_dispute",
+        status: dispute.status,
+        priority: "review",
+        createdAt: iso(dispute.createdAt)
+      }));
+      const supportRows = supportTickets.map((ticket) => ({
+        ...smartComplaintRow(ticket),
+        reason: ticket.category || "complaint",
+        description: ticket.complaint || "",
+        actualIssue: ticket.complaint || "",
+        source: ticket.source || "ai_support"
+      }));
+      rows = [...supportRows, ...disputeRows]
+        .sort((left, right) => new Date(right.createdAt || 0) - new Date(left.createdAt || 0))
+        .slice(0, limit);
+      metrics = {
+        totalComplaints: await ReviewDispute.countDocuments() + await SupportTicket.countDocuments(),
+        open: await ReviewDispute.countDocuments({ status: "open" }) + await SupportTicket.countDocuments({ status: "open" }),
+        inProgress: await ReviewDispute.countDocuments({ status: "reviewing" })
+          + await SupportTicket.countDocuments({ status: { $in: ["assigned", "in_progress", "escalated"] } }),
+        resolved: await ReviewDispute.countDocuments({ status: { $in: ["accepted", "rejected"] } })
+          + await SupportTicket.countDocuments({ status: { $in: ["resolved", "closed"] } })
+      };
+    } else if (resource === "notifications") {
+      const notifications = await AdminNotification.find().sort({ createdAt: -1 }).limit(limit);
+      rows = notifications.map((notification) => ({
+        id: id(notification._id),
+        title: notification.title,
+        sentTo: notification.targetType,
+        recipients: notification.recipientCount,
+        successCount: notification.successCount,
+        failureCount: notification.failureCount,
+        status: notification.status,
+        sentBy: notification.sentByEmail || notification.sentBy,
+        sentAt: iso(notification.sentAt || notification.scheduleAt || notification.createdAt),
+        createdAt: iso(notification.createdAt)
+      }));
+      metrics = {
+        totalNotifications: await AdminNotification.countDocuments(),
+        sentToday: await AdminNotification.countDocuments({ sentAt: { $gte: startOfToday() } }),
+        scheduled: await AdminNotification.countDocuments({ status: "scheduled" }),
+        failed: await AdminNotification.countDocuments({ status: "failed" })
+      };
+    } else if (resource === "reports") {
+      const [users, partners, bookings, completed, cancelled, disputes, tickets, paymentTotals] = await Promise.all([
+        User.countDocuments(),
+        Partner.countDocuments(),
+        Booking.countDocuments(),
+        Booking.countDocuments({ status: "completed" }),
+        Booking.countDocuments({ status: { $in: ["cancelled", "canceled"] } }),
+        ReviewDispute.countDocuments(),
+        SupportTicket.countDocuments(),
+        paymentSummaryTotals()
+      ]);
+      const revenue = paymentTotals.totalRevenue;
+      rows = [
+        { id: "users", reportType: "Total Users", currentValue: users },
+        { id: "partners", reportType: "Total Partners", currentValue: partners },
+        { id: "bookings", reportType: "Total Bookings", currentValue: bookings },
+        { id: "completedBookings", reportType: "Completed Bookings", currentValue: completed },
+        { id: "cancelledBookings", reportType: "Cancelled Bookings", currentValue: cancelled },
+        { id: "complaints", reportType: "Complaints", currentValue: disputes + tickets },
+        { id: "revenue", reportType: "Paid Revenue", currentValue: revenue }
+      ];
+      metrics = { users, partners, bookings, completed, cancelled, complaints: disputes + tickets, revenue };
+    } else if (["banners", "analytics", "audit-logs", "settings"].includes(resource)) {
+      rows = [];
+    } else {
+      return res.status(404).json({ message: "Resource not found" });
+    }
+
+    return res.json({ resource, rows, metrics });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function performAdminAction(req, res, next) {
+  try {
+    const action = String(req.body?.action || "").trim();
+    const targetId = String(req.body?.targetId || "").trim();
+    if (!action || !targetId) {
+      return res.status(400).json({ message: "action and targetId are required" });
+    }
+
+    if (action === "assign-booking") {
+      const booking = await Booking.findOne({
+        $or: [
+          { _id: objectId(targetId) || undefined },
+          { bookingCode: targetId }
+        ].filter((entry) => Object.values(entry)[0])
+      });
+      if (!booking) return res.status(404).json({ message: "Booking not found" });
+      if (booking.partnerId) return res.status(409).json({ message: "Booking already has an assigned partner" });
+      if (!partnerRequestableStatuses().includes(String(booking.status || ""))) {
+        return res.status(409).json({ message: `Booking cannot be forwarded while status is ${booking.status}` });
+      }
+
+      const requestedPartnerIds = [
+        req.body?.partnerId,
+        req.body?.payload?.partnerId,
+        ...(Array.isArray(req.body?.partnerIds) ? req.body.partnerIds : []),
+        ...(Array.isArray(req.body?.payload?.partnerIds) ? req.body.payload.partnerIds : [])
+      ].filter(Boolean);
+      const partners = await availablePartnersForBooking(booking, {
+        partnerIds: requestedPartnerIds,
+        onlineOnly: requestedPartnerIds.length === 0,
+        limit: requestedPartnerIds.length ? 10 : 30
+      });
+      if (!partners.length) {
+        return res.status(404).json({ message: "No approved partner found for this booking area/service" });
+      }
+
+      const result = await forwardBookingToPartners({
+        booking,
+        partners,
+        reason: String(req.body?.payload?.reason || "Admin dashboard assignment"),
+        mode: requestedPartnerIds.length ? "individual" : "area"
+      });
+      return res.json({
+        ok: true,
+        action,
+        targetId,
+        booking: smartBookingRow(result.booking),
+        assignedPartnerIds: result.partnerIds,
+        addedPartnerIds: result.addedPartnerIds
+      });
+    }
+
+    if (action === "approve-technician") {
+      const existingPartner = await Partner.findById(targetId).select("kycStatus accountStatus approvalVersion businessType laundryBusiness phoneHash emailHash");
+      if (!existingPartner) return res.status(404).json({ message: "Partner not found" });
+      if (existingPartner.accountStatus === "deleted") {
+        return res.status(409).json({ message: "Deleted partner cannot be approved" });
+      }
+      const isReapproval = existingPartner.kycStatus === "rejected"
+        || existingPartner.accountStatus === "blocked"
+        || existingPartner.accountStatus === "suspended";
+      const now = new Date();
+      const actor = req.auth?.email || req.auth?.uid || "admin";
+      const partner = await Partner.findByIdAndUpdate(
+        targetId,
+        {
+          $set: {
+            isOnline: true,
+            isVerified: true,
+            trustStatus: "trusted",
+            kycStatus: "verified",
+            businessVerificationStatus: existingPartner.businessType === "laundry" ? "approved" : "not_required",
+            accountStatus: "active",
+            approvedAt: now,
+            rejectedAt: null,
+            rejectionReason: ""
+          },
+          $inc: { approvalVersion: 1 },
+          $push: {
+            verificationHistory: {
+              action: isReapproval ? "reapproved" : "approved",
+              at: now,
+              by: actor,
+              note: isReapproval ? "Partner approved again after admin review" : "Partner approved after verification"
+            }
+          }
+        },
+        { new: true }
+      );
+      const linkedIdentityFilters = [];
+      if (existingPartner.phoneHash) linkedIdentityFilters.push({ phoneHash: existingPartner.phoneHash });
+      if (existingPartner.emailHash) linkedIdentityFilters.push({ emailHash: existingPartner.emailHash });
+      if (linkedIdentityFilters.length) {
+        await Partner.updateMany(
+          {
+            _id: { $ne: partner._id },
+            accountStatus: { $ne: "deleted" },
+            $or: linkedIdentityFilters
+          },
+          {
+            $set: {
+              isOnline: true,
+              isVerified: true,
+              trustStatus: "trusted",
+              kycStatus: "verified",
+              businessVerificationStatus: existingPartner.businessType === "laundry" ? "approved" : "not_required",
+              accountStatus: "active",
+              approvedAt: now,
+              rejectedAt: null,
+              rejectionReason: ""
+            },
+            $inc: { approvalVersion: 1 },
+            $push: {
+              verificationHistory: {
+                action: "approved_linked_identity",
+                at: now,
+                by: actor,
+                note: "Approval synchronized across the same verified partner identity"
+              }
+            }
+          }
+        );
+      }
+      if (partner.businessType === "laundry" && partner.laundryBusiness?.staffMembers?.length) {
+        for (const staff of partner.laundryBusiness.staffMembers) {
+          if (staff.verificationStatus !== "blocked") staff.verificationStatus = "verified";
+        }
+        partner.markModified("laundryBusiness.staffMembers");
+        await partner.save();
+      }
+      await sendPartnerApprovalWelcomeEmails(partner);
+      await cache.del("admin:dashboard:v1");
+      emitAdminEvent(isReapproval ? "partner:reapproved" : "partner:approved", {
+        partnerId: String(partner._id),
+        partnerCode: partner.partnerCode || "",
+        partnerName: partner.name || "",
+        partnerPhone: partner.phone || "",
+        status: partner.kycStatus,
+        by: actor,
+        source: "admin_dashboard",
+        approvalVersion: Number(partner.approvalVersion || 0),
+        previousKycStatus: existingPartner.kycStatus
+      });
+      emitPartnerEvent(partner._id, "partner:approval_updated", {
+        status: "approved",
+        approvalVersion: Number(partner.approvalVersion || 0),
+        action: isReapproval ? "reapproved" : "approved"
+      });
+      await reliableNotify({
+        recipients: [partnerNotificationRecipient(partner)],
+        title: isReapproval ? "Your account is approved again" : "You have been verified",
+        body: isReapproval
+          ? "Your ApnaServo partner account has been approved again. Keep your device online to receive bookings."
+          : "Your ApnaServo partner profile is approved. Keep your device online to receive bookings.",
+        category: "partner_approval",
+        priority: "high",
+        data: {
+          type: isReapproval ? "partner:reapproved" : "partner:approved",
+          targetApp: "partner",
+          actionType: "OPEN_PARTNER_HOME",
+          partnerId: partner._id,
+          status: "verified",
+          approvalVersion: Number(partner.approvalVersion || 0)
+        },
+        smsBody: isReapproval
+          ? "ApnaServo: Your partner account is approved again. Keep your device online to receive bookings."
+          : "ApnaServo: Your partner profile is verified. Keep your device online to receive bookings."
+      });
+      return res.json({ ok: true, action, targetId, status: partner.kycStatus, approval: "approved", reapproved: isReapproval, approvalVersion: Number(partner.approvalVersion || 0) });
+    }
+
+    if (action === "reject-technician" || action === "suspend-technician" || action === "block-technician") {
+      const isSuspend = action === "suspend-technician" || action === "block-technician";
+      const isBlock = action === "block-technician";
+      const now = new Date();
+      const actor = req.auth?.email || req.auth?.uid || "admin";
+      const reason = String(req.body?.payload?.reason || "").trim();
+      const historyAction = isBlock ? "blocked" : (isSuspend ? "suspended" : "rejected");
+      const rejectionTarget = await Partner.findById(targetId).select("businessType").lean();
+      if (!rejectionTarget) return res.status(404).json({ message: "Partner not found" });
+      const partner = await Partner.findByIdAndUpdate(
+        targetId,
+        {
+          $set: {
+            isOnline: false,
+            ...(rejectionTarget.businessType === "laundry" && !isSuspend ? { businessVerificationStatus: "rejected" } : {}),
+            isVerified: false,
+            kycStatus: isSuspend ? "verified" : "rejected",
+            trustStatus: isSuspend ? "suspended" : "review_required",
+            ...(!isSuspend ? { rejectedAt: now, rejectionReason: reason } : {}),
+            ...(isBlock ? { accountStatus: "blocked" } : {})
+          },
+          $push: {
+            verificationHistory: {
+              action: historyAction,
+              at: now,
+              by: actor,
+              note: reason || (isSuspend ? "Partner access blocked by admin" : "Partner verification rejected by admin")
+            }
+          }
+        },
+        { new: true }
+      );
+      if (!partner) return res.status(404).json({ message: "Partner not found" });
+      if (partner.businessType === "laundry" && !isSuspend) {
+        partner.businessVerificationStatus = "rejected";
+        for (const staff of partner.laundryBusiness?.staffMembers || []) {
+          if (staff.verificationStatus !== "blocked") staff.verificationStatus = "rejected";
+          staff.isOnline = false;
+        }
+        partner.markModified("laundryBusiness.staffMembers");
+        await partner.save();
+      }
+      await cache.del("admin:dashboard:v1");
+      emitAdminEvent(isBlock ? "partner:blocked" : (isSuspend ? "partner:suspended" : "partner:rejected"), {
+        partnerId: String(partner._id),
+        partnerCode: partner.partnerCode || "",
+        partnerName: partner.name || "",
+        partnerPhone: partner.phone || "",
+        status: isSuspend ? partner.trustStatus : partner.kycStatus
+      });
+      emitPartnerEvent(partner._id, "partner:approval_updated", {
+        status: isSuspend ? "suspended" : "rejected",
+        accountStatus: partner.accountStatus,
+        trustStatus: partner.trustStatus
+      });
+      await reliableNotify({
+        recipients: [partnerNotificationRecipient(partner)],
+        title: isSuspend ? "Partner account blocked" : "Verification not approved",
+        body: isSuspend
+          ? "Your ApnaServo partner account is blocked. Contact support for review."
+          : "Your ApnaServo partner verification was not approved. Please contact support or update your details.",
+        category: "partner_approval",
+        priority: "high",
+        data: {
+          type: isBlock ? "partner:blocked" : (isSuspend ? "partner:suspended" : "partner:rejected"),
+          targetApp: "partner",
+          actionType: "OPEN_PARTNER_HOME",
+          partnerId: partner._id,
+          status: isSuspend ? "blocked" : "rejected"
+        }
+      });
+      return res.json({ ok: true, action, targetId, status: isSuspend ? partner.accountStatus || partner.trustStatus : partner.kycStatus, approval: isSuspend ? "blocked" : "denied" });
+    }
+
+    if (action === "delete-partner") {
+      const partner = await Partner.findById(targetId);
+      if (!partner) return res.status(404).json({ message: "Partner not found" });
+      const activeBookingCount = await Booking.countDocuments({
+        partnerId: partner._id,
+        status: { $nin: ["completed", "cancelled", "canceled", "rejected"] }
+      });
+      if (activeBookingCount > 0) {
+        return res.status(409).json({ message: "This partner has active bookings. Reassign or complete those bookings before deleting." });
+      }
+      const now = new Date();
+      for (const device of partner.deviceTokens || []) {
+        device.isActive = false;
+        device.lastUpdatedAt = now;
+      }
+      partner.fcmToken = "";
+      partner.isOnline = false;
+      partner.isVerified = false;
+      partner.trustStatus = "suspended";
+      partner.accountStatus = "deleted";
+      partner.deletionRequestedAt = now;
+      partner.deletionReason = "Deleted by admin dashboard";
+      await partner.save();
+      await cache.del("admin:dashboard:v1");
+      emitAdminEvent("partner:deleted", {
+        partnerId: String(partner._id),
+        partnerCode: partner.partnerCode || "",
+        partnerName: partner.name || "",
+        partnerPhone: partner.phone || "",
+        status: partner.accountStatus
+      });
+      return res.json({ ok: true, action, targetId, status: "deleted", deleted: true });
+    }
+
+    if (action === "resume-partner") {
+      const partner = await Partner.findById(targetId);
+      if (!partner) return res.status(404).json({ message: "Partner not found" });
+      if (partner.accountStatus === "deleted" || partner.accountStatus === "deletion_requested") {
+        return res.status(409).json({ message: "Deleted partner cannot be resumed. They must register again." });
+      }
+      if (partner.accountStatus === "active" && partner.trustStatus === "trusted" && partner.isVerified) {
+        return res.status(409).json({ message: "Partner is already active" });
+      }
+      // Resume only restores a previously verified suspended/blocked partner;
+      // it never bypasses KYC for a rejected or unverified account.
+      if (partner.kycStatus !== "verified") {
+        return res.status(409).json({ message: "Partner must complete verification before their account can be resumed" });
+      }
+      const now = new Date();
+      const actor = req.auth?.email || req.auth?.uid || "admin";
+      partner.accountStatus = "active";
+      partner.trustStatus = "trusted";
+      partner.isVerified = true;
+      partner.isOnline = false;
+      partner.rejectedAt = null;
+      partner.rejectionReason = "";
+      partner.verificationHistory.push({ action: "reapproved", at: now, by: actor, note: "Partner access resumed by admin after review" });
+      await partner.save();
+      await cache.del("admin:dashboard:v1");
+      emitAdminEvent("partner:resumed", { partnerId: String(partner._id), partnerCode: partner.partnerCode || "", partnerName: partner.name || "", partnerPhone: partner.phone || "", status: "active", by: actor });
+      emitPartnerEvent(partner._id, "partner:approval_updated", { status: "approved", accountStatus: "active", action: "resumed" });
+      await reliableNotify({ recipients: [partnerNotificationRecipient(partner)], title: "Your partner account is active again", body: "Your ApnaServo partner access has been resumed. Go online when you are ready to receive bookings.", category: "partner_approval", priority: "high", data: { type: "partner:resumed", targetApp: "partner", actionType: "OPEN_PARTNER_HOME", partnerId: partner._id, status: "active" } });
+      return res.json({ ok: true, action, targetId, status: "active", resumed: true });
+    }
+
+    if (action === "delete-device") {
+      const deleted = await deactivateAdminDevice(targetId);
+      await cache.del("admin:dashboard:v1");
+      emitAdminEvent("device:deleted", {
+        ownerType: deleted.ownerType,
+        ownerId: deleted.ownerId,
+        ownerName: deleted.ownerName,
+        deviceIdentifier: deleted.deviceIdentifier
+      });
+      return res.json({ ok: true, action, targetId, deleted: true });
+    }
+
+    return res.json({
+      ok: true,
+      action,
+      targetId,
+      message: "Action accepted for audit; no state transition was required."
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+const platformResetPlan = [
+  ["Booking messages", BookingMessage],
+  ["Customer no response reports", CustomerNoResponseReport],
+  ["In-app notifications", InAppNotification],
+  ["Location logs", LocationLog],
+  ["Partner documents", PartnerDocument],
+  ["Payments", Payment],
+  ["Reviews", Review],
+  ["Review disputes", ReviewDispute],
+  ["Revisit requests", RevisitRequest],
+  ["Support tickets", SupportTicket],
+  ["Technician SOS", TechnicianSos],
+  ["Bookings", Booking],
+  ["Admin notifications", AdminNotification],
+  ["Admin activity", AdminActivity],
+  ["Partners", Partner],
+  ["Users", User]
+];
+
+async function resetPlatformData(req, res, next) {
+  try {
+    const confirm = String(req.body?.confirm || req.headers["x-admin-reset-confirm"] || "").trim();
+    if (confirm !== "DELETE_APNASERVO_DATA") {
+      return res.status(400).json({ message: "Reset confirmation is required" });
+    }
+
+    const results = [];
+    for (const [collection, model] of platformResetPlan) {
+      const before = await model.countDocuments();
+      const result = before > 0 ? await model.deleteMany({}) : { deletedCount: 0 };
+      results.push({ collection, before, deleted: result.deletedCount || 0 });
+    }
+
+    emitAdminEvent("platform:reset", {
+      by: req.auth?.email || req.auth?.uid || "admin",
+      collections: results.length,
+      deleted: results.reduce((sum, item) => sum + item.deleted, 0)
+    });
+    await cache.del("admin:dashboard:v1");
+    return res.json({ ok: true, reset: results });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function findUserByPhoneOrId(userId, mobileNumber) {
+  const directId = objectId(userId);
+  if (directId) {
+    const user = await User.findById(directId);
+    if (user) return user;
+  }
+  const mobileDigits = digits(mobileNumber).slice(-10);
+  if (!mobileDigits) return null;
+  const users = await User.find().select("name phone email");
+  return users.find((user) => digits(user.phone).slice(-10) === mobileDigits) || null;
+}
+
+async function userRestrictSetFromBookings({ bookingId, serviceType, bookingStatus }) {
+  if (!bookingId && !serviceType && !bookingStatus) return null;
+  const filter = {};
+  const bookingObjectId = objectId(bookingId);
+  if (bookingId) {
+    filter.$or = [
+      ...(bookingObjectId ? [{ _id: bookingObjectId }] : []),
+      { bookingId: regex(bookingId) },
+      { bookingCode: regex(bookingId) },
+      { publicId: regex(bookingId) }
+    ];
+  }
+  if (serviceType) {
+    filter.$and = [
+      ...(filter.$and || []),
+      {
+        $or: [
+          { serviceCategory: regex(serviceType) },
+          { serviceName: regex(serviceType) }
+        ]
+      }
+    ];
+  }
+  if (bookingStatus) filter.status = bookingStatus;
+  const userIds = await Booking.distinct("userId", filter);
+  return new Set(userIds.map(id).filter(Boolean));
+}
+
+async function userRestrictSetFromComplaints({ ticketId, complaintStatus }) {
+  if (!ticketId && !complaintStatus) return null;
+  const ticketObjectId = objectId(ticketId);
+  const ticketFilter = {};
+  if (ticketId) {
+      ticketFilter.$or = [
+      ...(ticketObjectId ? [{ _id: ticketObjectId }] : []),
+      { ticketCode: regex(ticketId) },
+      { publicId: regex(ticketId) }
+    ];
+  }
+  if (complaintStatus) ticketFilter.status = complaintStatus;
+  const disputeFilter = {};
+  if (complaintStatus) disputeFilter.status = complaintStatus;
+  const [ticketUserIds, disputeUserIds] = await Promise.all([
+    SupportTicket.distinct("userId", ticketFilter),
+    ReviewDispute.distinct("userId", disputeFilter)
+  ]);
+  return new Set([
+    ...ticketUserIds.map(id),
+    ...disputeUserIds.map(id)
+  ].filter(Boolean));
+}
+
+async function usersControlCenter(req, res, next) {
+  try {
+    const query = {
+      search: String(req.query.search || "").trim(),
+      name: String(req.query.name || "").trim(),
+      mobile: String(req.query.mobile || "").trim(),
+      bookingId: String(req.query.bookingId || "").trim(),
+      ticketId: String(req.query.ticketId || "").trim(),
+      serviceType: String(req.query.serviceType || "").trim(),
+      bookingStatus: String(req.query.bookingStatus || "").trim(),
+      complaintStatus: String(req.query.complaintStatus || "").trim(),
+      registrationDate: String(req.query.registrationDate || "").trim()
+    };
+    const page = safeLimit(req.query.page, 1, 100000);
+    const ticketPage = safeLimit(req.query.ticketPage, 1, 100000);
+    const pageSize = safeLimit(req.query.pageSize, 10, 100);
+
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    const [
+      totalUsers,
+      activeUsers,
+      newUsersToday,
+      totalBookings,
+      completedBookings,
+      cancelledBookings,
+      openReviewDisputes,
+      resolvedReviewDisputes,
+      openSupportTickets,
+      resolvedSupportTickets
+    ] = await Promise.all([
+      User.countDocuments(),
+      User.countDocuments({ accountStatus: "active" }),
+      User.countDocuments({ createdAt: { $gte: startOfToday } }),
+      Booking.countDocuments(),
+      Booking.countDocuments({ status: "completed" }),
+      Booking.countDocuments({ status: { $in: ["cancelled", "canceled"] } }),
+      ReviewDispute.countDocuments({ status: { $in: ["open", "reviewing"] } }),
+      ReviewDispute.countDocuments({ status: { $in: ["accepted", "rejected"] } }),
+      SupportTicket.countDocuments({ status: { $in: ["open", "assigned", "in_progress", "waiting_on_customer", "reopened", "escalated"] } }),
+      SupportTicket.countDocuments({ status: { $in: ["resolved", "closed"] } })
+    ]);
+
+    let bookingSearchSet = new Set();
+    let ticketSearchSet = new Set();
+    if (query.search) {
+      const searchRegex = regex(query.search);
+      const searchObjectId = objectId(query.search);
+      const [bookingUserIds, ticketUserIds] = await Promise.all([
+        Booking.distinct("userId", {
+          $or: [
+            ...(searchObjectId ? [{ _id: searchObjectId }] : []),
+            { bookingId: searchRegex },
+            { bookingCode: searchRegex },
+            { publicId: searchRegex },
+            { serviceName: searchRegex },
+            { serviceCategory: searchRegex }
+          ]
+        }),
+        SupportTicket.distinct("userId", {
+          $or: [
+            ...(searchObjectId ? [{ _id: searchObjectId }] : []),
+            { ticketCode: searchRegex },
+            { publicId: searchRegex },
+            { bookingCode: searchRegex }
+          ]
+        })
+      ]);
+      bookingSearchSet = new Set(bookingUserIds.map(id).filter(Boolean));
+      ticketSearchSet = new Set(ticketUserIds.map(id).filter(Boolean));
+    }
+
+    const [bookingRestrictSet, complaintRestrictSet] = await Promise.all([
+      userRestrictSetFromBookings(query),
+      userRestrictSetFromComplaints(query)
+    ]);
+
+    const registrationDate = query.registrationDate ? new Date(query.registrationDate) : null;
+    const registrationEnd = registrationDate && !Number.isNaN(registrationDate.getTime())
+      ? new Date(registrationDate.getTime() + 24 * 60 * 60 * 1000)
+      : null;
+
+    const userClauses = [];
+    if (/^ASU\d{5}$/i.test(query.search)) userClauses.push({ publicId: query.search.toUpperCase() });
+    if (registrationDate && registrationEnd) userClauses.push({ createdAt: { $gte: registrationDate, $lt: registrationEnd } });
+    for (const restrictSet of [bookingRestrictSet, complaintRestrictSet]) {
+      if (restrictSet) {
+        userClauses.push({ _id: { $in: [...restrictSet].map(objectId).filter(Boolean) } });
+      }
+    }
+    if (query.search && (/^ASU\d+/i.test(query.search) || bookingSearchSet.size || ticketSearchSet.size)) {
+      const searchRegex = regex(query.search);
+      const relatedIds = [...new Set([...bookingSearchSet, ...ticketSearchSet])].map(objectId).filter(Boolean);
+      userClauses.push({
+        $or: [
+          { city: searchRegex },
+          { publicId: searchRegex },
+          ...(relatedIds.length ? [{ _id: { $in: relatedIds } }] : [])
+        ]
+      });
+    }
+    const userFilter = userClauses.length ? { $and: userClauses } : {};
+
+    const ticketClauses = [];
+    if (query.ticketId) {
+      const ticketObjectId = objectId(query.ticketId);
+      ticketClauses.push({
+        $or: [
+          ...(ticketObjectId ? [{ _id: ticketObjectId }] : []),
+          { ticketCode: regex(query.ticketId) },
+          { publicId: regex(query.ticketId) }
+        ]
+      });
+    }
+    if (query.bookingId) {
+      const bookingObjectId = objectId(query.bookingId);
+      ticketClauses.push({
+        $or: [
+          ...(bookingObjectId ? [{ bookingId: bookingObjectId }] : []),
+          { bookingCode: regex(query.bookingId) }
+        ]
+      });
+    }
+    if (query.complaintStatus) ticketClauses.push({ status: query.complaintStatus });
+    if (query.search && /^(ASCU|ASCP|ASB)\d+/i.test(query.search)) {
+      const searchRegex = regex(query.search);
+      ticketClauses.push({
+        $or: [
+          { ticketCode: searchRegex },
+          { publicId: searchRegex },
+          { bookingCode: searchRegex },
+          { category: searchRegex }
+        ]
+      });
+    }
+    const ticketFilter = ticketClauses.length ? { $and: ticketClauses } : {};
+
+    const [rawUserCandidates, rawTicketCandidates] = await Promise.all([
+      User.find(userFilter).sort({ createdAt: -1 }).limit(10000).lean(),
+      SupportTicket.find(ticketFilter).sort({ lastUpdatedAt: -1, createdAt: -1 }).limit(10000).lean()
+    ]);
+    const decryptedUsers = rawUserCandidates.map(decryptAdminRecord);
+    const decryptedTickets = rawTicketCandidates.map(decryptAdminRecord);
+    const usersMatchingPii = decryptedUsers.filter((user) => {
+      if (query.name && !includesText(user.name, query.name)) return false;
+      if (query.mobile && !includesText(digits(user.phone), digits(query.mobile))) return false;
+      if (!query.search) return true;
+      const related = bookingSearchSet.has(id(user._id)) || ticketSearchSet.has(id(user._id));
+      return related || [user.publicId, user.name, user.phone, user.email, user.city].some((value) => includesText(value, query.search));
+    });
+    const ticketsMatchingPii = decryptedTickets.filter((ticket) => {
+      if (query.name && !includesText(ticket.userName || ticket.partnerName, query.name)) return false;
+      if (query.mobile && !includesText(digits(ticket.mobileNumber), digits(query.mobile))) return false;
+      if (!query.search) return true;
+      return [ticket.publicId, ticket.ticketCode, ticket.userName, ticket.partnerName, ticket.mobileNumber, ticket.email, ticket.bookingCode, ticket.category, ticket.complaint].some((value) => includesText(value, query.search));
+    });
+    const filteredUserCount = usersMatchingPii.length;
+    const filteredTicketCount = ticketsMatchingPii.length;
+    const users = usersMatchingPii.slice((page - 1) * pageSize, page * pageSize);
+    const tickets = ticketsMatchingPii.slice((ticketPage - 1) * pageSize, ticketPage * pageSize);
+
+    const userIds = users.map((user) => user._id);
+    const [bookingCounts, disputeCounts, ticketCounts] = userIds.length ? await Promise.all([
+      Booking.aggregate([{ $match: { userId: { $in: userIds } } }, { $group: { _id: "$userId", total: { $sum: 1 } } }]),
+      ReviewDispute.aggregate([{ $match: { userId: { $in: userIds } } }, { $group: { _id: "$userId", total: { $sum: 1 } } }]),
+      SupportTicket.aggregate([{ $match: { userId: { $in: userIds } } }, { $group: { _id: "$userId", total: { $sum: 1 } } }])
+    ]) : [[], [], []];
+    const bookingCountMap = new Map(bookingCounts.map((entry) => [id(entry._id), entry.total]));
+    const disputeCountMap = new Map(disputeCounts.map((entry) => [id(entry._id), entry.total]));
+    const ticketCountMap = new Map(ticketCounts.map((entry) => [id(entry._id), entry.total]));
+
+    return res.json({
+      analytics: {
+        totalUsers,
+        activeUsers,
+        newUsersToday,
+        totalBookings,
+        completedBookings,
+        cancelledBookings,
+        openComplaints: openReviewDisputes + openSupportTickets,
+        resolvedComplaints: resolvedReviewDisputes + resolvedSupportTickets
+      },
+      users: users.map((user) => {
+        const userId = id(user._id);
+        const addressList = savedAddresses(user);
+        return {
+          id: user.publicId || userId,
+          userId: user.publicId || "",
+          fullName: user.name || "",
+          mobileNumber: user.phone || "",
+          email: user.email || "",
+          profilePhoto: user.profilePhotoUrl || "",
+          registrationDateTime: iso(user.createdAt),
+          lastLoginTime: iso(user.lastLoginAt),
+          accountStatus: normalizeAccountStatus(user.accountStatus),
+          rawAccountStatus: user.accountStatus || "active",
+          totalBookings: bookingCountMap.get(userId) || 0,
+          totalComplaintsRaised: (disputeCountMap.get(userId) || 0) + (ticketCountMap.get(userId) || 0),
+          currentLocation: coordinates(user.location),
+          savedAddresses: addressList,
+          savedAddressText: addressList.map((entry) => entry.address).filter(Boolean).join(" | "),
+          deviceInformation: summarizeDeviceInfo(user.deviceInfo),
+          devices: (user.deviceTokens || []).filter((device) => device.isActive).map((device) => ({
+            deviceId: device.publicId || "",
+            platform: device.platform || "",
+            osVersion: user.deviceInfo?.osVersion || user.deviceInfo?.os || "",
+            model: user.deviceInfo?.model || user.deviceInfo?.manufacturer || "",
+            appVersion: user.deviceInfo?.appVersion || "",
+            lastActiveAt: iso(device.lastUpdatedAt)
+          }))
+        };
+      }),
+      supportTickets: tickets.map(serializeSupportTicket),
+      pagination: {
+        users: { page, pageSize, total: filteredUserCount },
+        supportTickets: { page: ticketPage, pageSize, total: filteredTicketCount }
+      }
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function userProfile(req, res, next) {
+  try {
+    const userObjectId = objectId(req.params.userId);
+    const user = await User.findOne(userObjectId ? { _id: userObjectId } : { publicId: String(req.params.userId || "").toUpperCase() });
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const bookings = await Booking.find({ userId: user._id }).sort({ createdAt: -1 });
+    const bookingIds = bookings.map((booking) => booking._id);
+    const [payments, disputes, noResponseReports, revisitRequests, sosReports, messages, ticketCandidates] = await Promise.all([
+      Payment.find({ userId: user._id }).sort({ createdAt: -1 }),
+      ReviewDispute.find({ userId: user._id }).sort({ createdAt: -1 }),
+      CustomerNoResponseReport.find({ userId: user._id }).sort({ createdAt: -1 }),
+      RevisitRequest.find({ userId: user._id }).sort({ createdAt: -1 }),
+      TechnicianSos.find({ userId: user._id }).sort({ createdAt: -1 }),
+      bookingIds.length ? BookingMessage.find({ bookingId: { $in: bookingIds } }).sort({ createdAt: 1 }).limit(500) : [],
+      SupportTicket.find({ $or: [{ userId: user._id }, { userId: null }] }).sort({ createdAt: -1 }).limit(1000)
+    ]);
+
+    const userPhone = digits(user.phone).slice(-10);
+    const tickets = ticketCandidates.filter((ticket) => id(ticket.userId) === id(user._id) || (userPhone && digits(ticket.mobileNumber).slice(-10) === userPhone));
+    const paymentsByBooking = new Map();
+    for (const payment of payments) {
+      const key = id(payment.bookingId);
+      paymentsByBooking.set(key, [...(paymentsByBooking.get(key) || []), payment]);
+    }
+    const messagesByBooking = new Map();
+    const bookingPublicIdByInternalId = new Map(bookings.map((booking) => [id(booking._id), booking.publicId || booking.bookingCode || ""]));
+    for (const message of messages) {
+      const key = id(message.bookingId);
+      messagesByBooking.set(key, [...(messagesByBooking.get(key) || []), message]);
+    }
+
+    return res.json({
+      user: {
+        id: id(user._id),
+        userId: user.publicId || "",
+        fullName: user.name || "",
+        mobileNumber: user.phone || "",
+        email: user.email || "",
+        profilePhoto: user.profilePhotoUrl || "",
+        address: user.address || "",
+        savedAddresses: savedAddresses(user),
+        city: user.city || "",
+        currentLocation: coordinates(user.location),
+        registrationDateTime: iso(user.createdAt),
+        lastLoginTime: iso(user.lastLoginAt),
+        phoneVerified: Boolean(user.phoneVerified),
+        phoneVerifiedAt: iso(user.phoneVerifiedAt),
+        bookingRiskStatus: user.bookingRiskStatus || "",
+        fakeBookingWarningCount: user.fakeBookingWarningCount || 0,
+        accountStatus: normalizeAccountStatus(user.accountStatus),
+        rawAccountStatus: user.accountStatus || "active",
+        deviceInformation: summarizeDeviceInfo(user.deviceInfo),
+        devices: (user.deviceTokens || []).filter((device) => device.isActive).map((device) => ({
+          deviceId: device.publicId || "",
+          platform: device.platform || "",
+          osVersion: user.deviceInfo?.osVersion || user.deviceInfo?.os || "",
+          model: user.deviceInfo?.model || user.deviceInfo?.manufacturer || "",
+          appVersion: user.deviceInfo?.appVersion || "",
+          lastActiveAt: iso(device.lastUpdatedAt)
+        })),
+        registrationHistory: (user.registrationHistory || []).map((entry) => ({
+          source: entry.source || "",
+          provider: entry.provider || "",
+          registeredAt: iso(entry.registeredAt),
+          ip: entry.ip || "",
+          userAgent: entry.userAgent || ""
+        })),
+        loginHistory: (user.loginHistory || []).map((entry) => ({
+          loggedInAt: iso(entry.loggedInAt),
+          deviceInfo: entry.deviceInfo || {}
+        })),
+        adminNotes: (user.adminNotes || []).map((entry) => ({
+          id: id(entry._id),
+          note: entry.note || "",
+          addedBy: entry.addedBy || "",
+          addedAt: iso(entry.addedAt)
+        }))
+      },
+      bookingHistory: bookings.map((booking) => serializeBookingHistory(
+        booking,
+        paymentsByBooking.get(id(booking._id)) || [],
+        messagesByBooking.get(id(booking._id)) || []
+      )),
+      complaintHistory: [
+        ...disputes.map((entry) => ({ type: "review_dispute", ...serializeDispute(entry) })),
+        ...noResponseReports.map((entry) => ({
+          type: "customer_no_response",
+          id: id(entry._id),
+          bookingId: id(entry.bookingId),
+          bookingCode: entry.bookingCode || "",
+          reason: entry.reason || "",
+          status: entry.status || "",
+          createdAt: iso(entry.createdAt),
+          reportedAt: iso(entry.reportedAt)
+        })),
+        ...revisitRequests.map((entry) => ({
+          type: "revisit_request",
+          id: id(entry._id),
+          bookingId: id(entry.bookingId),
+          bookingCode: entry.bookingCode || "",
+          reason: entry.reason || "",
+          message: entry.message || "",
+          status: entry.status || "",
+          requestedAt: iso(entry.requestedAt),
+          createdAt: iso(entry.createdAt)
+        })),
+        ...sosReports.map((entry) => ({
+          type: "technician_sos",
+          id: id(entry._id),
+          bookingId: id(entry.bookingId),
+          bookingCode: entry.bookingCode || "",
+          reason: entry.reason || "",
+          note: entry.note || "",
+          status: entry.status || "",
+          createdAt: iso(entry.createdAt)
+        }))
+      ].sort((a, b) => new Date(b.createdAt || b.requestedAt || b.reportedAt || 0).getTime() - new Date(a.createdAt || a.requestedAt || a.reportedAt || 0).getTime()),
+      supportTicketHistory: tickets.map(serializeSupportTicket),
+      paymentHistory: payments.map((payment) => ({
+        ...serializePayment(payment),
+        bookingId: bookingPublicIdByInternalId.get(id(payment.bookingId)) || ""
+      }))
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function updateUserAdminState(req, res, next) {
+  try {
+    const userObjectId = objectId(req.params.userId);
+    const userFilter = userObjectId ? { _id: userObjectId } : { publicId: String(req.params.userId || "").toUpperCase() };
+    const allowedStatuses = new Set(["active", "suspended", "blocked"]);
+    const update = {};
+    const status = String(req.body?.accountStatus || "").trim().toLowerCase();
+    if (status) {
+      if (!allowedStatuses.has(status)) return res.status(400).json({ message: "Invalid account status" });
+      update.accountStatus = status;
+    }
+
+    const note = String(req.body?.adminNote || "").trim().slice(0, 2000);
+    const operations = {};
+    if (Object.keys(update).length) operations.$set = update;
+    if (note) {
+      operations.$push = {
+        adminNotes: {
+          note,
+          addedBy: req.auth?.email || "admin",
+          addedAt: new Date()
+        }
+      };
+    }
+    if (!Object.keys(operations).length) return res.status(400).json({ message: "No user changes supplied" });
+    const user = await User.findOneAndUpdate(userFilter, operations, { new: true });
+    if (!user) return res.status(404).json({ message: "User not found" });
+    emitAdminEvent("user:updated", { userId: id(user._id), accountStatus: user.accountStatus });
+    return res.json({ ok: true, userId: user.publicId || "", accountStatus: user.accountStatus });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+function partnerDocumentUrl(req, document) {
+  if (document.partnerUploadAssetId) {
+    return partnerAssetUrl(req, document.partnerUploadAssetId);
+  }
+  return document.url || "";
+}
+
+function latestPartnerProfileDocumentUrl(req, documents = []) {
+  const profileTypes = new Set(["profile_photo", "selfie_photo", "face_photo", "selfie_verification"]);
+  const document = documents.find((entry) => profileTypes.has(String(entry.documentType || "").toLowerCase()));
+  return document ? partnerDocumentUrl(req, document) : "";
+}
+
+async function profileDocumentUrlMap(req, partnerIds = []) {
+  if (!partnerIds.length) return new Map();
+  const documents = await PartnerDocument.find({
+    partnerId: { $in: partnerIds },
+    documentType: { $in: ["profile_photo", "selfie_photo", "face_photo", "selfie_verification"] }
+  }).sort({ createdAt: -1 });
+  const urls = new Map();
+  for (const document of documents) {
+    const partnerKey = id(document.partnerId);
+    if (!urls.has(partnerKey)) {
+      urls.set(partnerKey, partnerDocumentUrl(req, document));
+    }
+  }
+  return urls;
+}
+
+function serializePartnerDocument(document, req) {
+  return {
+    id: id(document._id),
+    documentType: document.documentType || "",
+    originalName: document.originalName || "",
+    mimeType: document.mimeType || "",
+    sizeBytes: Number(document.sizeBytes || 0),
+    url: partnerDocumentUrl(req, document),
+    storageProvider: document.storageProvider || "",
+    partnerUploadAssetId: id(document.partnerUploadAssetId),
+    validationStatus: document.validationStatus || "review",
+    validationScore: Number(document.validationScore || 0),
+    validationReasons: document.validationReasons || [],
+    ocrStatus: document.ocrStatus || "",
+    aadhaarLast4: document.aadhaarLast4 || "",
+    uploadedAt: iso(document.createdAt),
+    updatedAt: iso(document.updatedAt)
+  };
+}
+
+async function partnerUploadAsset(req, res, next) {
+  try {
+    const assetObjectId = objectId(req.params.assetId);
+    if (!assetObjectId || !verifyPartnerAssetToken(assetObjectId, req.query.token)) {
+      return res.status(404).json({ message: "Asset not found" });
+    }
+    const record = await PartnerUploadAsset.findById(assetObjectId).lean();
+    if (!record) return res.status(404).json({ message: "Asset not found" });
+    const buffer = Buffer.from(record.dataBase64 || "", "base64");
+    res.set("Content-Type", record.mimeType || "image/jpeg");
+    res.set("Content-Length", String(buffer.length));
+    res.set("Cache-Control", "private, max-age=2592000, immutable");
+    res.set("Content-Disposition", `inline; filename="${(record.originalName || "partner-upload.jpg").replace(/"/g, "")}"`);
+    return res.send(buffer);
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function partnerProfile(req, res, next) {
+  try {
+    const partnerObjectId = objectId(req.params.partnerId);
+    if (!partnerObjectId) return res.status(400).json({ message: "Invalid partner id" });
+    const partner = await Partner.findById(partnerObjectId);
+    if (!partner) return res.status(404).json({ message: "Partner not found" });
+    const [documents, bookings, tickets, reviews] = await Promise.all([
+      PartnerDocument.find({ partnerId: partner._id }).sort({ documentType: 1, createdAt: -1 }),
+      Booking.find({ partnerId: partner._id }).sort({ createdAt: -1 }).limit(100),
+      SupportTicket.find({ partnerId: partner._id }).sort({ createdAt: -1 }).limit(100),
+      Review.find({ partnerId: partner._id }).sort({ createdAt: -1 }).limit(100)
+    ]);
+    const approved = partner.isVerified === true && partner.kycStatus === "verified" && partner.trustStatus === "trusted";
+    const blocked = partner.accountStatus === "blocked" || partner.accountStatus === "suspended" || partner.trustStatus === "suspended";
+    const rawProfile = partner.toObject({ getters: true });
+    const profilePhoto = partner.profilePhotoAssetId
+      ? partnerAssetUrl(req, partner.profilePhotoAssetId)
+      : (partner.photoUrl || partner.selfieUrl || latestPartnerProfileDocumentUrl(req, documents));
+    delete rawProfile.fcmToken;
+    delete rawProfile.deviceTokens;
+    rawProfile.laundryBusiness = laundryBusinessView(partner);
+    const activityHistory = [
+      ...(partner.verificationHistory || []).map((entry, index) => ({
+        id: `${id(partner._id)}:verification:${index}`,
+        type: "verification",
+        title: `Verification ${String(entry.action || "updated").replace(/_/g, " ")}`,
+        description: [entry.note || "", entry.by ? `By ${entry.by}` : ""].filter(Boolean).join(" - "),
+        createdAt: iso(entry.at)
+      })),
+      ...documents.map((document) => ({
+        id: `${id(document._id)}:document`,
+        type: "document",
+        title: `${String(document.documentType || "Document").replace(/_/g, " ")} uploaded`,
+        description: `Validation status: ${document.validationStatus || "review"}`,
+        createdAt: iso(document.createdAt)
+      })),
+      ...bookings.map((booking) => ({
+        id: `${id(booking._id)}:booking`,
+        type: "booking",
+        title: `Booking ${booking.bookingCode || id(booking._id)}`,
+        description: `${booking.serviceName || booking.serviceCategory || "Service"} - ${booking.status || "pending"}`,
+        createdAt: iso(booking.updatedAt || booking.createdAt)
+      })),
+      ...tickets.map((ticket) => ({
+        id: `${id(ticket._id)}:support`,
+        type: "support",
+        title: ticket.subject || ticket.title || ticket.category || "Support ticket",
+        description: `Ticket ${ticket.ticketCode || id(ticket._id)} - ${ticket.status || "open"}`,
+        createdAt: iso(ticket.updatedAt || ticket.createdAt)
+      })),
+      ...reviews.map((review) => ({
+        id: `${id(review._id)}:review`,
+        type: "review",
+        title: `${Number(review.rating || 0)} star customer rating`,
+        description: review.comment || "Customer submitted a rating.",
+        createdAt: iso(review.createdAt)
+      })),
+      {
+        id: `${id(partner._id)}:registered`,
+        type: "registration",
+        title: "Partner registered",
+        description: `${partner.name || "Partner"} submitted the registration profile.`,
+        createdAt: iso(partner.createdAt)
+      }
+    ].filter((entry) => entry.createdAt).sort((left, right) => new Date(right.createdAt) - new Date(left.createdAt));
+    return res.json({
+      partner: {
+        id: id(partner._id),
+        partnerId: partner.publicId || partner.partnerCode || "",
+        firebaseUid: partner.firebaseUid || "",
+        partnerCode: partner.partnerCode || "",
+        profilePhoto,
+        photoUrl: partner.photoUrl || "",
+        selfieUrl: partner.selfieUrl || "",
+        fullName: partner.name || "",
+        mobileNumber: partner.phone || "",
+        email: partner.email || "",
+        dateOfBirth: partner.dateOfBirth || "",
+        gender: partner.gender || "",
+        completeResidentialAddress: partner.residentialAddress || "",
+        city: partner.city || "",
+        state: partner.state || "",
+        pinCode: partner.pinCode || "",
+        emergencyContactNumber: partner.emergencyContactNumber || "",
+        professionServiceCategory: partner.serviceCategory || [],
+        yearsOfExperience: Number(partner.yearsOfExperience || 0),
+        workingAreas: partner.workingAreas || [],
+        serviceArea: partner.serviceArea || "",
+        serviceRadiusKm: Number(partner.serviceRadiusKm || 0),
+        currentLocation: coordinates(partner.location),
+        languagesKnown: partner.languagesKnown || [],
+        businessType: partner.businessType || "",
+        businessVerificationStatus: partner.businessVerificationStatus || "not_required",
+        laundryBusiness: laundryBusinessView(partner),
+        laundryStaffMembers: laundryBusinessView(partner)?.staffMembers || [],
+        termsConsent: {
+          accepted: partner.termsConsent?.accepted === true,
+          version: partner.termsConsent?.version || "",
+          acceptedAt: iso(partner.termsConsent?.acceptedAt),
+          clientAcceptedAt: iso(partner.termsConsent?.clientAcceptedAt),
+          registrationFlow: partner.termsConsent?.registrationFlow || "",
+          serviceCategory: partner.termsConsent?.serviceCategory || "",
+          documentKey: partner.termsConsent?.documentKey || "",
+          sourceApp: partner.termsConsent?.sourceApp || "",
+          ipAddress: partner.termsConsent?.ipAddress || ""
+        },
+        termsAcceptanceHistory: (partner.termsAcceptanceHistory || []).map((entry) => ({
+          accepted: entry.accepted === true,
+          version: entry.version || "",
+          acceptedAt: iso(entry.acceptedAt),
+          clientAcceptedAt: iso(entry.clientAcceptedAt),
+          registrationFlow: entry.registrationFlow || "",
+          serviceCategory: entry.serviceCategory || "",
+          documentKey: entry.documentKey || "",
+          sourceApp: entry.sourceApp || ""
+        })),
+        registrationDate: iso(partner.createdAt),
+        currentVerificationStatus: blocked ? "Blocked" : (approved ? "Approved" : (partner.kycStatus === "rejected" ? "Rejected" : "Under Verification")),
+        approvalVersion: Number(partner.approvalVersion || 0),
+        approvedAt: iso(partner.approvedAt),
+        rejectedAt: iso(partner.rejectedAt),
+        rejectionReason: partner.rejectionReason || "",
+        verificationHistory: partner.verificationHistory || [],
+        isVerified: Boolean(partner.isVerified),
+        kycStatus: partner.kycStatus || "",
+        trustStatus: partner.trustStatus || "",
+        accountStatus: partner.accountStatus || "active",
+        online: Boolean(partner.isOnline),
+        rating: Number(partner.rating || 0),
+        ratingCount: Number(partner.ratingCount || 0),
+        aadhaarStatus: partner.aadhaarStatus || "",
+        idProofStatus: partner.idProofStatus || "",
+        skillCertificateStatus: partner.skillCertificateStatus || "",
+        rawProfile
+      },
+      documents: documents.map((document) => serializePartnerDocument(document, req)),
+      bookingHistory: bookings.map(bookingRow),
+      supportTickets: tickets.map(serializeSupportTicket),
+      reviewHistory: reviews.map((review) => {
+        const booking = bookings.find((item) => String(item._id) === String(review.bookingId));
+        return {
+          id: id(review._id),
+          bookingId: id(review.bookingId),
+          bookingCode: booking?.bookingCode || id(review.bookingId),
+          customerName: booking?.userSnapshot?.name || "Customer",
+          rating: Number(review.rating || 0),
+          comment: review.comment || "",
+          status: review.status || "published",
+          disputeStatus: review.disputeStatus || "none",
+          createdAt: iso(review.createdAt)
+        };
+      }),
+      activityHistory
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function updatePartnerDocument(req, res, next) {
+  try {
+    const partnerObjectId = objectId(req.params.partnerId);
+    const documentObjectId = objectId(req.params.documentId);
+    if (!partnerObjectId || !documentObjectId) return res.status(400).json({ message: "Invalid partner or document id" });
+    const status = String(req.body?.validationStatus || "").trim().toLowerCase();
+    if (!["accepted", "rejected", "review"].includes(status)) {
+      return res.status(400).json({ message: "Invalid validation status" });
+    }
+    const document = await PartnerDocument.findOneAndUpdate(
+      { _id: documentObjectId, partnerId: partnerObjectId },
+      { $set: { validationStatus: status } },
+      { new: true }
+    );
+    if (!document) return res.status(404).json({ message: "Document not found" });
+    emitAdminEvent("partner:document_updated", {
+      partnerId: String(partnerObjectId),
+      documentId: String(document._id),
+      documentType: document.documentType,
+      status
+    });
+    return res.json({ ok: true, document: serializePartnerDocument(document, req) });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function bookingTimelineDetails(req, res, next) {
+  try {
+    const raw = String(req.params.bookingId || "").trim();
+    const bookingObjectId = objectId(raw);
+    const booking = await Booking.findOne({
+      $or: [
+        ...(bookingObjectId ? [{ _id: bookingObjectId }] : []),
+          { bookingId: raw.toUpperCase() },
+          { bookingCode: raw },
+        { publicId: raw.toUpperCase() }
+      ]
+    });
+    if (!booking) return res.status(404).json({ message: "Booking not found" });
+    const requestPartnerIds = [...new Set((booking.partnerRequests || []).map((request) => objectId(request.partnerId)).filter(Boolean))];
+    const [payments, messages, partners] = await Promise.all([
+      Payment.find({ bookingId: booking._id }).sort({ createdAt: 1 }),
+      BookingMessage.find({ bookingId: booking._id }).sort({ createdAt: 1 }).limit(200),
+      requestPartnerIds.length
+        ? Partner.find({ _id: { $in: requestPartnerIds } })
+          .select("_id partnerCode name phone photoUrl selfieUrl serviceCategory rating totalJobs isOnline accountStatus isVerified")
+          .lean()
+        : []
+    ]);
+    const availabilityById = new Map(partners.map((partner) => [String(partner._id), partner]));
+    return res.json({ booking: serializeBookingHistory(booking, payments, messages, availabilityById) });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function updateBookingLocation(req, res, next) {
+  try {
+    const raw = String(req.params.bookingId || "").trim();
+    const bookingObjectId = objectId(raw);
+    const current = await Booking.findOne({
+      $or: [
+        ...(bookingObjectId ? [{ _id: bookingObjectId }] : []),
+        { bookingId: raw.toUpperCase() },
+        { bookingCode: raw },
+        { publicId: raw.toUpperCase() }
+      ]
+    });
+    if (!current) return res.status(404).json({ message: "Booking not found" });
+    const address = String(req.body?.address || "").trim();
+    const lat = Number(req.body?.lat);
+    const lng = Number(req.body?.lng);
+    if (address.length < 10 || !Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+      return res.status(400).json({ message: "Complete address and valid coordinates are required" });
+    }
+    const expectedVersion = Number(req.body?.expectedVersion || current.locationVersion || 1);
+    const now = new Date();
+    const booking = await Booking.findOneAndUpdate(
+      { _id: current._id, locationVersion: expectedVersion },
+      {
+        $set: {
+          address,
+          city: String(req.body?.city || current.city || "Guwahati").trim(),
+          location: { type: "Point", coordinates: [lng, lat] },
+          addressDetails: {
+            houseFlat: String(req.body?.houseFlat || "").trim(),
+            building: String(req.body?.building || "").trim(),
+            floor: String(req.body?.floor || "").trim(),
+            room: String(req.body?.room || "").trim(),
+            landmark: String(req.body?.landmark || "").trim()
+          },
+          locationUpdatedAt: now,
+          locationUpdatedBy: "admin",
+          locationChange: {
+            state: current.partnerId ? "pending_partner_ack" : "none",
+            reason: "",
+            changedAt: now,
+            respondedAt: null,
+            changedBy: "admin"
+          }
+        },
+        $inc: { locationVersion: 1 },
+        $push: { statusTimeline: { status: "location_updated", at: now, by: "admin", note: `Version ${expectedVersion + 1}` } }
+      },
+      { new: true }
+    );
+    if (!booking) {
+      const latest = await Booking.findById(current._id);
+      return res.status(409).json({ message: "Location was updated elsewhere", booking: serializeBookingHistory(latest) });
+    }
+    emitBookingStatusUpdate(booking);
+    emitAdminEvent("booking:location_updated", {
+      bookingId: String(booking._id),
+      bookingCode: booking.bookingCode,
+      userId: String(booking.userId),
+      partnerId: booking.partnerId ? String(booking.partnerId) : "",
+      address: booking.address,
+      lat,
+      lng,
+      locationVersion: booking.locationVersion,
+      locationUpdatedAt: booking.locationUpdatedAt,
+      actorRole: "admin"
+    });
+    const [user, partner] = await Promise.all([
+      User.findById(booking.userId),
+      booking.partnerId ? Partner.findById(booking.partnerId) : null
+    ]);
+    await reliableNotify({
+      recipients: [userNotificationRecipient(user), partnerNotificationRecipient(partner)].filter(Boolean),
+      title: "Service Location Updated",
+      body: `The service address for booking ${booking.bookingCode} was updated by support.`,
+      category: "booking_location_updated",
+      priority: "high",
+      data: { type: "booking:location_updated", bookingId: booking._id, bookingCode: booking.bookingCode }
+    });
+    return res.json({ booking: serializeBookingHistory(booking) });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function listSupportTickets(req, res, next) {
+  try {
+    const status = String(req.query.status || "").trim();
+    const filter = status ? { status } : {};
+    const limit = safeLimit(req.query.limit, 100, 250);
+    const tickets = await SupportTicket.find(filter).sort({ lastUpdatedAt: -1, createdAt: -1 }).limit(limit).lean();
+    return res.json({ tickets: tickets.map(serializeSupportTicket) });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function createSupportTicket(req, res, next) {
+  try {
+    const body = req.body || {};
+    const user = await findUserByPhoneOrId(body.userId, body.mobileNumber || body.phone);
+    const now = new Date();
+    const ticket = await SupportTicket.create({
+      ticketCode: String(body.ticketId || body.ticketCode || ticketCode()).trim(),
+      userId: user?._id || null,
+      bookingId: objectId(body.bookingId),
+      bookingCode: String(body.bookingCode || "").trim(),
+      userName: String(body.userName || user?.name || "").trim(),
+      mobileNumber: String(body.mobileNumber || body.phone || user?.phone || "").trim(),
+      email: String(body.email || user?.email || "").trim(),
+      category: String(body.category || body.ticketCategory || "general").trim(),
+      priority: String(body.priority || "normal").trim().toLowerCase(),
+      status: String(body.status || "open").trim().toLowerCase(),
+      source: String(body.source || "ai_support").trim(),
+      complaint: String(body.complaint || body.message || "").trim(),
+      aiSummary: String(body.aiSummary || body.summary || "").trim(),
+      conversation: Array.isArray(body.conversation) ? body.conversation : [],
+      attachments: Array.isArray(body.attachments) ? body.attachments : [],
+      timeline: [{ event: "ticket_created", by: body.source || "ai_support", note: "Support ticket generated", at: now }],
+      lastUpdatedAt: now
+    });
+    emitAdminEvent("support:ticket_created", {
+      ticketId: ticket.ticketCode,
+      userId: id(ticket.userId),
+      userName: ticket.userName,
+      priority: ticket.priority,
+      status: ticket.status
+    });
+    return res.status(201).json({ ticket: serializeSupportTicket(ticket) });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function findTicket(raw) {
+  const ticketObjectId = objectId(raw);
+  return SupportTicket.findOne({
+    $or: [
+      ...(ticketObjectId ? [{ _id: ticketObjectId }] : []),
+      { ticketCode: String(raw || "").trim() },
+      { publicId: String(raw || "").trim().toUpperCase() }
+    ]
+  });
+}
+
+async function supportTicketDetails(req, res, next) {
+  try {
+    const ticket = await findTicket(req.params.ticketId);
+    if (!ticket) return res.status(404).json({ message: "Support ticket not found" });
+    ticket.adminUnreadCount = 0;
+    ticket.adminLastReadAt = new Date();
+    await ticket.save();
+    const booking = ticket.bookingId
+      ? await Booking.findById(ticket.bookingId).select("serviceCategory serviceName city address partnerSnapshot bookingCode")
+      : null;
+    return res.json({
+      ticket: {
+        ...serializeSupportTicket(ticket),
+        serviceCategory: booking?.serviceCategory || "",
+        serviceName: booking?.serviceName || "",
+        area: booking?.city || "",
+        customerAddress: booking?.address || "",
+        assignedPartnerName: booking?.partnerSnapshot?.name || "",
+        bookingCode: ticket.bookingCode || booking?.bookingCode || ""
+      }
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function updateSupportTicket(req, res, next) {
+  try {
+    const ticket = await findTicket(req.params.ticketId);
+    if (!ticket) return res.status(404).json({ message: "Support ticket not found" });
+    const body = req.body || {};
+    const now = new Date();
+    const actor = req.auth?.email || "admin";
+    const action = String(body.action || "update").trim();
+
+    if (body.assignedTo !== undefined) {
+      ticket.assignedTo = String(body.assignedTo || "").trim();
+      if (ticket.assignedTo && ticket.status === "open") ticket.status = "assigned";
+      ticket.timeline.push({ event: "assigned", by: actor, note: ticket.assignedTo, at: now });
+    }
+    if (body.status) {
+      ticket.status = String(body.status).trim().toLowerCase();
+      ticket.timeline.push({ event: "status_changed", by: actor, note: ticket.status, at: now });
+    }
+    if (body.priority) {
+      const priority = String(body.priority).trim().toLowerCase();
+      ticket.priority = priority === "critical" ? "urgent" : priority;
+      ticket.timeline.push({ event: "priority_changed", by: actor, note: ticket.priority, at: now });
+    }
+    if (action === "mark_resolved") {
+      ticket.status = "resolved";
+      ticket.resolvedAt = now;
+      ticket.timeline.push({ event: "resolved", by: actor, note: body.resolutionNotes || "", at: now });
+    }
+    if (action === "reopen") {
+      ticket.status = "reopened";
+      ticket.reopenedAt = now;
+      ticket.timeline.push({ event: "reopened", by: actor, note: body.internalNote || "", at: now });
+    }
+    if (action === "escalate") {
+      ticket.status = "escalated";
+      ticket.escalatedTo = String(body.escalatedTo || body.assignedTo || "senior_support").trim();
+      ticket.timeline.push({ event: "escalated", by: actor, note: ticket.escalatedTo, at: now });
+    }
+    const internalNote = String(body.internalNote || "").trim().slice(0, 2000);
+    if (internalNote) {
+      ticket.internalNotes.push({ note: internalNote, addedBy: actor, addedAt: now });
+      ticket.timeline.push({ event: "internal_note_added", by: actor, note: internalNote.slice(0, 180), at: now });
+    }
+    const adminReply = String(body.adminReply || "").trim().slice(0, 3000);
+    if (adminReply) {
+      if (!ticket.assignedTo) {
+        return res.status(400).json({ message: "Assign this ticket to a support agent before replying" });
+      }
+      const reply = { senderRole: "support", senderName: ticket.assignedTo, message: adminReply, attachments: [], createdAt: now };
+      ticket.adminReplies.push(reply);
+      ticket.conversation.push(reply);
+      ticket.timeline.push({ event: "admin_replied", by: actor, note: adminReply.slice(0, 180), at: now });
+      ticket.userUnreadCount = Number(ticket.userUnreadCount || 0) + 1;
+    }
+    if (body.resolutionNotes !== undefined) {
+      ticket.resolutionNotes = String(body.resolutionNotes || "").trim().slice(0, 3000);
+    }
+    ticket.lastUpdatedAt = now;
+    await ticket.save();
+    if (adminReply && ticket.userId) {
+      const user = await User.findById(ticket.userId);
+      try {
+        await reliableNotify({
+          recipients: [userNotificationRecipient(user)].filter(Boolean),
+          title: `Reply from ${ticket.assignedTo}`,
+          body: adminReply.slice(0, 180),
+          category: "support_reply",
+          priority: "high",
+          data: {
+            type: "support:reply",
+            actionType: "OPEN_SUPPORT",
+            targetApp: "USER",
+            ticketId: ticket.publicId || ticket.ticketCode
+          }
+        });
+      } catch (notificationError) {
+        console.error("support_reply_notification_failed", {
+          requestId: req.requestId || "",
+          ticketId: ticket.publicId || ticket.ticketCode,
+          userId: String(ticket.userId),
+          message: notificationError?.message || "Unknown notification error"
+        });
+      }
+    }
+    emitAdminEvent("support:ticket_updated", {
+      ticketId: ticket.ticketCode,
+      status: ticket.status,
+      assignedTo: ticket.assignedTo
+    });
+    return res.json({ ticket: serializeSupportTicket(ticket) });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function listReviewDisputes(req, res, next) {
+  try {
+    const status = String(req.query.status || "open").toLowerCase();
+    const query = status === "all" ? {} : { status };
+    const disputes = await ReviewDispute.find(query).sort({ createdAt: -1 }).limit(100);
+    return res.json({ disputes: disputes.map(serializeDispute) });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function resolveReviewDispute(req, res, next) {
+  try {
+    const action = String(req.body?.action || "").toLowerCase();
+    if (!["reviewing", "accept", "reject"].includes(action)) {
+      return res.status(400).json({ message: "action must be reviewing, accept, or reject" });
+    }
+
+    const dispute = await ReviewDispute.findById(req.params.disputeId);
+    if (!dispute) {
+      return res.status(404).json({ message: "Dispute not found" });
+    }
+    const review = await Review.findById(dispute.reviewId);
+    if (!review) {
+      return res.status(404).json({ message: "Review not found" });
+    }
+
+    if (action === "reviewing") {
+      dispute.status = "reviewing";
+    } else if (action === "accept") {
+      dispute.status = "accepted";
+      dispute.resolvedAt = new Date();
+      review.status = "hidden";
+      review.disputeStatus = "resolved";
+      review.resolvedAt = dispute.resolvedAt;
+    } else {
+      dispute.status = "rejected";
+      dispute.resolvedAt = new Date();
+      review.status = "published";
+      review.disputeStatus = "resolved";
+      review.resolvedAt = dispute.resolvedAt;
+    }
+
+    const note = String(req.body?.resolutionNote || "").slice(0, 1000);
+    dispute.resolutionNote = note;
+    dispute.resolvedBy = req.auth.email || req.auth.uid || "admin";
+    review.adminResolution = note;
+    await Promise.all([dispute.save(), review.save()]);
+    emitAdminEvent("complaint:updated", {
+      disputeId: id(dispute._id),
+      bookingId: id(dispute.bookingId),
+      bookingCode: dispute.bookingCode || "",
+      userId: id(dispute.userId),
+      status: dispute.status
+    });
+
+    await Booking.findByIdAndUpdate(review.bookingId, {
+      $set: {
+        "reviewSnapshot.status": review.status,
+        "reviewSnapshot.disputeStatus": review.disputeStatus
+      }
+    });
+    const ratingSummary = await recomputePartnerRating(review.partnerId);
+
+    return res.json({
+      dispute: serializeDispute(dispute),
+      review: {
+        id: String(review._id),
+        status: review.status,
+        disputeStatus: review.disputeStatus
+      },
+      partnerRating: ratingSummary
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function bookingLaunchSettings(req, res, next) {
+  try {
+    return res.json(await getBookingLaunchConfig());
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function updateBookingLaunchSettings(req, res, next) {
+  try {
+    const config = await setBookingLaunchAt(req.body?.bookingLaunchAt, req.auth.email || req.auth.uid || "admin");
+    emitAdminEvent("settings:booking_launch_updated", config);
+    return res.json(config);
+  } catch (error) {
+    return next(error);
+  }
+}
+
+// ── Partner monetization settings (299 / 25% / 10 days) ────────────────────
+async function monetizationSettings(req, res, next) {
+  try {
+    const config = await getMonetizationConfig();
+    return res.json({
+      partner_subscription_amount: config.subscriptionAmount,
+      cleaning_commission_rate: config.cleaningCommissionRate,
+      cleaning_commission_percent: Math.round(config.cleaningCommissionRate * 100),
+      partner_free_trial_days: config.freeTrialDays
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function updateMonetizationSettings(req, res, next) {
+  try {
+    const body = req.body || {};
+    const updatedBy = req.auth.email || req.auth.uid || "admin";
+    const applied = {};
+
+    if (body.partner_subscription_amount !== undefined) {
+      applied.partner_subscription_amount = await setMonetizationSetting(
+        MONETIZATION_KEYS.subscriptionAmount, body.partner_subscription_amount, updatedBy
+      );
+    }
+    // Accept either a 0–1 rate or a 0–100 percent for convenience.
+    if (body.cleaning_commission_rate !== undefined) {
+      applied.cleaning_commission_rate = await setMonetizationSetting(
+        MONETIZATION_KEYS.cleaningCommissionRate, body.cleaning_commission_rate, updatedBy
+      );
+    } else if (body.cleaning_commission_percent !== undefined) {
+      const rate = Number(body.cleaning_commission_percent) / 100;
+      applied.cleaning_commission_rate = await setMonetizationSetting(
+        MONETIZATION_KEYS.cleaningCommissionRate, rate, updatedBy
+      );
+    }
+    if (body.partner_free_trial_days !== undefined) {
+      applied.partner_free_trial_days = await setMonetizationSetting(
+        MONETIZATION_KEYS.freeTrialDays, body.partner_free_trial_days, updatedBy
+      );
+    }
+
+    const config = await getMonetizationConfig();
+    emitAdminEvent("settings:monetization_updated", config);
+    return res.json({
+      applied,
+      partner_subscription_amount: config.subscriptionAmount,
+      cleaning_commission_rate: config.cleaningCommissionRate,
+      cleaning_commission_percent: Math.round(config.cleaningCommissionRate * 100),
+      partner_free_trial_days: config.freeTrialDays
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function partnerSubscriptionOverview(req, res, next) {
+  try {
+    const now = new Date();
+    const search = String(req.query.search || "").trim();
+    const modelFilter = String(req.query.model || "").trim(); // subscription | commission
+    const statusFilter = String(req.query.status || "").trim(); // trial | active | expired
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 100));
+
+    const query = { accountStatus: { $ne: "deleted" } };
+    if (modelFilter === "subscription" || modelFilter === "commission") {
+      query.billingModel = modelFilter;
+    }
+    if (search) {
+      query.$or = [
+        { partnerCode: new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i") }
+      ];
+    }
+
+    const partners = await Partner.find(query)
+      .select("partnerCode name serviceCategory billingModel subscriptionStatus subscriptionExpiresAt trialEndsAt createdAt")
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    const rows = partners.map((partner) => {
+      const model = billingService.resolveBillingModel(partner);
+      const status = billingService.resolveSubscriptionStatus(partner, now);
+      return {
+        partnerId: String(partner._id),
+        partnerCode: partner.partnerCode || "",
+        name: partner.name || "",
+        serviceCategory: partner.serviceCategory || [],
+        billingModel: model,
+        subscriptionStatus: status,
+        active: billingService.isPartnerBillingActive(partner, now),
+        withinTrial: billingService.isWithinTrial(partner, now),
+        trialDaysRemaining: billingService.trialDaysRemaining(partner, now),
+        trialEndsAt: partner.trialEndsAt || null,
+        subscriptionExpiresAt: partner.subscriptionExpiresAt || null,
+        createdAt: partner.createdAt || null
+      };
+    }).filter((row) => (statusFilter ? row.subscriptionStatus === statusFilter : true));
+
+    return res.json({ partners: rows, count: rows.length });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function overridePartnerSubscription(req, res, next) {
+  try {
+    const partnerObjectId = objectId(req.params.partnerId);
+    if (!partnerObjectId) {
+      return res.status(400).json({ message: "Invalid partner id" });
+    }
+    const partner = await Partner.findById(partnerObjectId);
+    if (!partner) {
+      return res.status(404).json({ message: "Partner not found" });
+    }
+
+    const body = req.body || {};
+    const now = new Date();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+
+    // Extend subscription by N months (stacking from current expiry if active).
+    if (body.extendSubscriptionMonths !== undefined) {
+      const months = Number(body.extendSubscriptionMonths);
+      if (!Number.isFinite(months) || months <= 0) {
+        return res.status(400).json({ message: "extendSubscriptionMonths must be a positive number" });
+      }
+      const base = partner.subscriptionExpiresAt && new Date(partner.subscriptionExpiresAt) > now
+        ? new Date(partner.subscriptionExpiresAt)
+        : now;
+      partner.subscriptionExpiresAt = new Date(base.getTime() + months * 30 * DAY_MS);
+      partner.subscriptionStatus = "active";
+    }
+
+    // Set an explicit expiry date (override).
+    if (body.subscriptionExpiresAt !== undefined) {
+      const date = body.subscriptionExpiresAt ? new Date(body.subscriptionExpiresAt) : null;
+      if (body.subscriptionExpiresAt && Number.isNaN(date.getTime())) {
+        return res.status(400).json({ message: "subscriptionExpiresAt must be a valid date" });
+      }
+      partner.subscriptionExpiresAt = date;
+    }
+
+    // Extend / set the free trial window.
+    if (body.extendTrialDays !== undefined) {
+      const days = Number(body.extendTrialDays);
+      if (!Number.isFinite(days) || days <= 0) {
+        return res.status(400).json({ message: "extendTrialDays must be a positive number" });
+      }
+      const base = partner.trialEndsAt && new Date(partner.trialEndsAt) > now
+        ? new Date(partner.trialEndsAt)
+        : now;
+      partner.trialEndsAt = new Date(base.getTime() + days * DAY_MS);
+    }
+    if (body.trialEndsAt !== undefined) {
+      const date = body.trialEndsAt ? new Date(body.trialEndsAt) : null;
+      if (body.trialEndsAt && Number.isNaN(date.getTime())) {
+        return res.status(400).json({ message: "trialEndsAt must be a valid date" });
+      }
+      partner.trialEndsAt = date;
+    }
+
+    // Re-derive the stored status from the resulting dates.
+    partner.subscriptionStatus = billingService.resolveSubscriptionStatus(partner, now);
+    await partner.save();
+
+    emitAdminEvent("partner:subscription_overridden", {
+      partnerId: String(partner._id),
+      partnerCode: partner.partnerCode || "",
+      subscriptionStatus: partner.subscriptionStatus,
+      subscriptionExpiresAt: partner.subscriptionExpiresAt,
+      trialEndsAt: partner.trialEndsAt
+    });
+
+    return res.json({
+      partnerId: String(partner._id),
+      billingModel: billingService.resolveBillingModel(partner),
+      subscriptionStatus: partner.subscriptionStatus,
+      active: billingService.isPartnerBillingActive(partner, now),
+      withinTrial: billingService.isWithinTrial(partner, now),
+      trialDaysRemaining: billingService.trialDaysRemaining(partner, now),
+      subscriptionExpiresAt: partner.subscriptionExpiresAt,
+      trialEndsAt: partner.trialEndsAt
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+module.exports = {
+  bookingLaunchSettings,
+  updateBookingLaunchSettings,
+  monetizationSettings,
+  updateMonetizationSettings,
+  partnerSubscriptionOverview,
+  overridePartnerSubscription,
+  dashboard,
+  listAdminActivity,
+  serviceInterestAnalytics,
+  createPartner,
+  listResourceRows,
+  performAdminAction,
+  smartAssignmentDashboard,
+  smartAssignBooking,
+  smartBulkAssignPending,
+  resetPlatformData,
+  usersControlCenter,
+  userProfile,
+  updateUserAdminState,
+  partnerUploadAsset,
+  partnerProfile,
+  updatePartnerDocument,
+  bookingTimelineDetails,
+  updateBookingLocation,
+  listSupportTickets,
+  createSupportTicket,
+  supportTicketDetails,
+  updateSupportTicket,
+  listReviewDisputes,
+  resolveReviewDispute
+};

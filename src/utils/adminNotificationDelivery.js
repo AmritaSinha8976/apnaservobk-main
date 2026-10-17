@@ -1,0 +1,299 @@
+const mongoose = require("mongoose");
+const { admin } = require("../config/firebase");
+const AdminNotification = require("../models/AdminNotification");
+const InAppNotification = require("../models/InAppNotification");
+const User = require("../models/User");
+const Partner = require("../models/Partner");
+const { activeDeviceTokens, tokenHash } = require("./notificationTokens");
+const { emitAdminEvent } = require("../sockets/bookingSocket");
+
+const FCM_BATCH_SIZE = 500;
+const INSERT_BATCH_SIZE = 1000;
+const INVALID_FCM_CODES = new Set([
+  "messaging/invalid-registration-token",
+  "messaging/registration-token-not-registered",
+  "messaging/invalid-argument"
+]);
+
+function objectId(value) {
+  return mongoose.Types.ObjectId.isValid(String(value || "")) ? new mongoose.Types.ObjectId(String(value)) : null;
+}
+
+function chunk(items, size) {
+  const chunks = [];
+  for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size));
+  return chunks;
+}
+
+function cleanData(data = {}) {
+  const out = {};
+  for (const [key, value] of Object.entries(data)) out[key] = value == null ? "" : String(value);
+  return out;
+}
+
+function targetAppFor(notification) {
+  return notification.targetType === "ALL_PARTNERS" || notification.targetType === "SPECIFIC_PARTNER" ? "PARTNER" : "USER";
+}
+
+function deliveryPlatformFor(notification) {
+  const platform = String(notification.deliveryPlatform || "both").toLowerCase();
+  return platform === "android" || platform === "ios" ? platform : "both";
+}
+
+function tokensForPlatform(owner, role, platform) {
+  const tokens = activeDeviceTokens(owner, role);
+  return platform === "both"
+    ? tokens
+    : tokens.filter((device) => String(device.platform || "android").toLowerCase() === platform);
+}
+
+function dataPayload(notification, targetApp) {
+  return cleanData({
+    type: "ADMIN_NOTIFICATION",
+    notificationId: String(notification._id),
+    targetApp,
+    actionType: notification.actionType || "NONE",
+    actionId: notification.actionId || "",
+    imageUrl: notification.imageUrl || "",
+    title: notification.title,
+    body: notification.message
+  });
+}
+
+function pushImageUrl(value) {
+  const url = String(value || "").trim();
+  if (!/^https:\/\/\S+$/i.test(url)) return "";
+  if (url.includes("/api/admin/notifications/assets/")) return url;
+  if (/\.(png|jpe?g|webp|gif)(\?.*)?$/i.test(url)) return url;
+  if (/res\.cloudinary\.com\/.+\/image\/upload\//i.test(url)) return url;
+  if (/googleusercontent\.com|gstatic\.com/i.test(url)) return url;
+  return "";
+}
+
+async function resolveRecipients(notification) {
+  const platform = deliveryPlatformFor(notification);
+  const withMatchingDevice = (records, role) => records
+    .filter((owner) => tokensForPlatform(owner, role, platform).length > 0)
+    .map((owner) => ({ role, owner }));
+  if (notification.targetType === "LAUNCH_SUBSCRIBERS") {
+    const users = await User.find({
+      accountStatus: { $nin: ["blocked", "deleted"] },
+      launchNotificationRequestedAt: { $ne: null },
+      launchNotificationFor: notification.scheduleAt
+    })
+      .select("_id firebaseUid name phone email fcmToken deviceTokens accountStatus")
+      .sort({ createdAt: -1 });
+    return withMatchingDevice(users, "user");
+  }
+  if (notification.targetType === "ALL_USERS") {
+    const users = await User.find({ accountStatus: { $nin: ["blocked", "deleted"] } })
+      .select("_id firebaseUid name phone email fcmToken deviceTokens accountStatus")
+      .sort({ createdAt: -1 });
+    return withMatchingDevice(users, "user");
+  }
+  if (notification.targetType === "ALL_PARTNERS") {
+    const partners = await Partner.find({ accountStatus: { $nin: ["deleted"] }, trustStatus: { $ne: "suspended" } })
+      .select("_id firebaseUid name phone email fcmToken deviceTokens accountStatus trustStatus")
+      .sort({ createdAt: -1 });
+    return withMatchingDevice(partners, "partner");
+  }
+  if (notification.targetType === "SPECIFIC_USER") {
+    const ids = (notification.targetUserIds || []).map(objectId).filter(Boolean);
+    const users = ids.length
+      ? await User.find({ _id: { $in: ids } }).select("_id firebaseUid name phone email fcmToken deviceTokens accountStatus")
+      : [];
+    return withMatchingDevice(users, "user");
+  }
+  if (notification.targetType === "SPECIFIC_PARTNER") {
+    const ids = (notification.targetPartnerIds || []).map(objectId).filter(Boolean);
+    const partners = ids.length
+      ? await Partner.find({ _id: { $in: ids } }).select("_id firebaseUid name phone email fcmToken deviceTokens accountStatus trustStatus")
+      : [];
+    return withMatchingDevice(partners, "partner");
+  }
+  return [];
+}
+
+async function createInAppRecords(notification, recipients, targetApp) {
+  const docs = recipients.map(({ role, owner }) => ({
+    recipientRole: role,
+    userId: role === "user" ? owner._id : null,
+    partnerId: role === "partner" ? owner._id : null,
+    recipientFirebaseUid: owner.firebaseUid || "",
+    adminNotificationId: notification._id,
+    title: notification.title,
+    body: notification.message,
+    imageUrl: notification.imageUrl || "",
+    actionType: notification.actionType || "NONE",
+    actionId: notification.actionId || "",
+    type: "ADMIN_NOTIFICATION",
+    category: targetApp === "PARTNER" ? "partner_admin" : "admin_announcement",
+    priority: "normal",
+    data: dataPayload(notification, targetApp),
+    pushStatus: "pending"
+  }));
+  let insertedCount = 0;
+  for (const batch of chunk(docs, INSERT_BATCH_SIZE)) {
+    if (batch.length) {
+      await InAppNotification.bulkWrite(batch.map((doc) => ({
+        updateOne: {
+          filter: {
+            adminNotificationId: notification._id,
+            recipientRole: doc.recipientRole,
+            ...(doc.userId ? { userId: doc.userId } : { partnerId: doc.partnerId })
+          },
+          update: { $setOnInsert: doc },
+          upsert: true
+        }
+      })), { ordered: false });
+      insertedCount += batch.length;
+    }
+  }
+  return insertedCount;
+}
+
+async function deactivateInvalidTokens(invalidTokens) {
+  const hashes = invalidTokens.map((entry) => entry.tokenHash).filter(Boolean);
+  const plainTokens = invalidTokens.map((entry) => entry.token).filter(Boolean);
+  if (!hashes.length && !plainTokens.length) return;
+  const now = new Date();
+  await Promise.all([
+    hashes.length ? User.updateMany(
+      { "deviceTokens.tokenHash": { $in: hashes } },
+      { $set: { "deviceTokens.$[device].isActive": false, "deviceTokens.$[device].lastUpdatedAt": now } },
+      { arrayFilters: [{ "device.tokenHash": { $in: hashes } }] }
+    ) : null,
+    hashes.length ? Partner.updateMany(
+      { "deviceTokens.tokenHash": { $in: hashes } },
+      { $set: { "deviceTokens.$[device].isActive": false, "deviceTokens.$[device].lastUpdatedAt": now } },
+      { arrayFilters: [{ "device.tokenHash": { $in: hashes } }] }
+    ) : null,
+    ...plainTokens.map((token) => User.updateMany({ fcmToken: token }, { $set: { fcmToken: "" } })),
+    ...plainTokens.map((token) => Partner.updateMany({ fcmToken: token }, { $set: { fcmToken: "" } }))
+  ].filter(Boolean));
+}
+
+async function sendFcm(notification, recipients, targetApp) {
+  const tokenEntries = [];
+  const seen = new Set();
+  const deliveryPlatform = deliveryPlatformFor(notification);
+  for (const recipient of recipients) {
+    for (const device of tokensForPlatform(recipient.owner, recipient.role, deliveryPlatform)) {
+      if (!device.token || seen.has(device.token)) continue;
+      seen.add(device.token);
+      tokenEntries.push(device);
+    }
+  }
+  if (!tokenEntries.length) {
+    return { successCount: 0, failureCount: 0, invalidTokens: [], errors: [] };
+  }
+
+  const payloadData = dataPayload(notification, targetApp);
+  const imageUrl = pushImageUrl(notification.imageUrl);
+  const invalidTokens = [];
+  const errors = [];
+  let successCount = 0;
+  let failureCount = 0;
+
+  for (const batch of chunk(tokenEntries, FCM_BATCH_SIZE)) {
+    const response = await admin.messaging().sendEachForMulticast({
+      tokens: batch.map((entry) => entry.token),
+      notification: {
+        title: notification.title,
+        body: notification.message,
+        ...(imageUrl ? { imageUrl } : {})
+      },
+      data: payloadData,
+      android: {
+        priority: "high",
+        notification: {
+          channelId: targetApp === "PARTNER" ? "partner_admin_announcements" : "admin_announcements",
+          sound: "default",
+          ...(imageUrl ? { imageUrl } : {})
+        }
+      },
+      apns: {
+        headers: { "apns-priority": "10" },
+        payload: { aps: { sound: "default", ...(imageUrl ? { "mutable-content": 1 } : {}) } },
+        ...(imageUrl ? { fcmOptions: { imageUrl } } : {})
+      }
+    });
+    successCount += Number(response.successCount || 0);
+    failureCount += Number(response.failureCount || 0);
+    response.responses.forEach((result, index) => {
+      if (result.success) return;
+      const entry = batch[index];
+      const code = result.error?.code || "messaging/unknown";
+      const message = result.error?.message || code;
+      errors.push({ tokenHash: entry.tokenHash || tokenHash(entry.token), code, message: message.slice(0, 240) });
+      if (INVALID_FCM_CODES.has(code)) {
+        invalidTokens.push({ token: entry.token, tokenHash: entry.tokenHash || tokenHash(entry.token) });
+      }
+    });
+  }
+
+  if (invalidTokens.length) await deactivateInvalidTokens(invalidTokens);
+  return { successCount, failureCount, invalidTokens, errors: errors.slice(0, 50) };
+}
+
+async function deliverAdminNotification(notificationOrId) {
+  const notificationId = typeof notificationOrId === "string"
+    ? notificationOrId
+    : notificationOrId?._id;
+  if (!notificationId) throw new Error("Notification not found");
+  const notification = await AdminNotification.findOneAndUpdate(
+    { _id: notificationId, status: { $in: ["draft", "scheduled"] } },
+    { $set: { status: "sending" } },
+    { new: true }
+  );
+  if (!notification) {
+    const current = await AdminNotification.findById(notificationId);
+    if (!current) throw new Error("Notification not found");
+    return current;
+  }
+
+  const recipients = await resolveRecipients(notification);
+  const targetApp = targetAppFor(notification);
+  const inAppCount = await createInAppRecords(notification, recipients, targetApp);
+  const delivery = await sendFcm(notification, recipients, targetApp);
+
+  notification.recipientCount = recipients.length;
+  notification.successCount = delivery.successCount;
+  notification.failureCount = Math.max(recipients.length - delivery.successCount, delivery.failureCount);
+  notification.invalidTokenCount = delivery.invalidTokens.length;
+  notification.errorMessages = delivery.errors;
+  notification.metadata = {
+    ...(notification.metadata || {}),
+    inAppStoredCount: inAppCount,
+    pushSuccessCount: delivery.successCount,
+    pushFailureCount: delivery.failureCount
+  };
+  notification.sentAt = new Date();
+  notification.status = recipients.length < 1 || delivery.successCount < 1
+    ? "failed"
+    : delivery.failureCount > 0 || delivery.successCount < recipients.length
+      ? "partially_sent"
+      : "sent";
+  await notification.save();
+
+  emitAdminEvent("notification:sent", {
+    notificationId: String(notification._id),
+    title: notification.title,
+    targetType: notification.targetType,
+    deliveryPlatform: deliveryPlatformFor(notification),
+    status: notification.status,
+    recipientCount: notification.recipientCount,
+    successCount: notification.successCount,
+    failureCount: notification.failureCount,
+    pushSuccessCount: delivery.successCount,
+    pushFailureCount: delivery.failureCount
+  });
+  return notification;
+}
+
+module.exports = {
+  deliverAdminNotification,
+  resolveRecipients,
+  targetAppFor,
+  deliveryPlatformFor
+};

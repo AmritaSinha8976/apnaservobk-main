@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cleaning Services — ApnaServo Admin</title>
+  <link rel="stylesheet" href="admin.css">
+</head>
+<body>
+
+<!-- Top bar -->
+<header class="topbar">
+  <span class="topbar-logo">ApnaServo Admin</span>
+  <span class="topbar-user" id="topbarUser"></span>
+  <button class="btn-link" onclick="logout()">Sign out</button>
+</header>
+
+<!-- Main page -->
+<main class="page">
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title">Cleaning Services</span>
+      <button class="btn btn-primary btn-sm" id="addBtn">+ Add Service</button>
+    </div>
+
+    <div id="listAlert" class="alert hidden" style="margin:16px 20px 0;"></div>
+
+    <div id="serviceList" class="service-list">
+      <div class="empty-state"><p>Loading…</p></div>
+    </div>
+  </div>
+</main>
+
+<!-- ── Edit / Add Modal ── -->
+<div id="modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title" id="modalTitle">Add Service</span>
+      <button class="modal-close" id="modalClose" aria-label="Close">×</button>
+    </div>
+    <div class="modal-body">
+      <div id="modalAlert" class="alert hidden"></div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="fName">Service Name <span style="color:var(--danger)">*</span></label>
+          <input type="text" id="fName" placeholder="e.g. Deep Home Cleaning">
+          <div class="field-error hidden" id="fNameErr"></div>
+        </div>
+        <div class="form-group">
+          <label for="fCategory">Category Slug <span style="color:var(--danger)">*</span></label>
+          <input type="text" id="fCategory" placeholder="e.g. cleaning_deep">
+          <div class="field-error hidden" id="fCategoryErr"></div>
+          <div class="form-hint">Unique identifier, lowercase, no spaces.</div>
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="fPrice">Fixed Price (₹) <span style="color:var(--danger)">*</span></label>
+          <input type="number" id="fPrice" min="0" placeholder="499">
+          <div class="field-error hidden" id="fPriceErr"></div>
+        </div>
+        <div class="form-group">
+          <label for="fOriginalPrice">Original Price (₹) <span style="color:var(--muted);font-weight:400">optional</span></label>
+          <input type="number" id="fOriginalPrice" min="0" placeholder="699">
+          <div class="form-hint">Leave blank if no offer.</div>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label for="fOfferPrice">Offer Price (₹) <span style="color:var(--muted);font-weight:400">optional</span></label>
+        <input type="number" id="fOfferPrice" min="0" placeholder="399">
+        <div class="form-hint">Shown as the discounted price when set.</div>
+      </div>
+
+      <div class="form-group">
+        <div class="toggle-wrap">
+          <label class="toggle" for="fActive">
+            <input type="checkbox" id="fActive" checked>
+            <span class="toggle-slider"></span>
+          </label>
+          <span>Active (visible to customers)</span>
+        </div>
+      </div>
+
+      <!-- What's included -->
+      <div class="checklist-section">
+        <h4>✅ What's Included</h4>
+        <div class="checklist-items" id="includedItems"></div>
+        <button type="button" class="btn btn-secondary btn-sm" id="addIncluded">+ Add item</button>
+      </div>
+
+      <!-- What's not included -->
+      <div class="checklist-section">
+        <h4>❌ What's Not Included</h4>
+        <div class="checklist-items" id="excludedItems"></div>
+        <button type="button" class="btn btn-secondary btn-sm" id="addExcluded">+ Add item</button>
+      </div>
+    </div>
+
+    <div class="modal-footer">
+      <button class="btn btn-secondary" id="cancelBtn">Cancel</button>
+      <button class="btn btn-primary" id="saveBtn">Save Service</button>
+    </div>
+  </div>
+</div>
+
+<script src="admin.js"></script>
+<script src="services.js"></script>
+</body>
+</html>

@@ -1,0 +1,422 @@
+const mongoose = require("mongoose");
+const encryptedFieldsPlugin = require("../utils/encryptedFieldsPlugin");
+const { BOOKING_STATUSES } = require("../utils/bookingLifecycle");
+const { publicIdPlugin } = require("../utils/publicIds");
+
+const pointSchema = new mongoose.Schema(
+  {
+    type: { type: String, enum: ["Point"], default: "Point" },
+    coordinates: { type: [Number], default: [0, 0] }
+  },
+  { _id: false }
+);
+
+const partnerRequestSchema = new mongoose.Schema(
+  {
+    requestId: { type: String, required: true, trim: true },
+    partnerId: { type: mongoose.Schema.Types.ObjectId, ref: "Partner", required: true },
+    partnerPublicId: { type: String, trim: true, default: "" },
+    partnerSnapshot: {
+      name: { type: String, trim: true, default: "" },
+      phone: { type: String, trim: true, default: "" },
+      photoUrl: { type: String, trim: true, default: "" },
+      serviceCategory: { type: String, trim: true, default: "" },
+      rating: { type: Number, default: 0 },
+      totalJobs: { type: Number, default: 0 },
+      wasOnline: { type: Boolean, default: false }
+    },
+    routing: {
+      serviceMatched: { type: Boolean, default: false },
+      partnerOnline: { type: Boolean, default: false },
+      accountActive: { type: Boolean, default: false },
+      partnerVerified: { type: Boolean, default: false },
+      kycVerified: { type: Boolean, default: false },
+      trustedPartner: { type: Boolean, default: false },
+      locationTrusted: { type: Boolean, default: false },
+      withinDispatchRadius: { type: Boolean, default: false },
+      withinPartnerServiceRadius: { type: Boolean, default: false },
+      distanceMeters: { type: Number, default: null },
+      dispatchRadiusKm: { type: Number, default: 0 },
+      dispatchMode: { type: String, trim: true, default: "" }
+    },
+    source: { type: String, enum: ["automatic", "manual", "area", "individual", "bulk"], default: "automatic" },
+    dispatchAttempt: { type: Number, min: 1, default: 1 },
+    dispatchStage: { type: Number, min: 1, default: 1 },
+    status: {
+      type: String,
+      enum: ["requested", "delivered", "viewed", "accepted", "rejected", "expired", "cancelled", "failed"],
+      default: "requested"
+    },
+    createdAt: { type: Date, default: Date.now },
+    sentAt: { type: Date, default: null },
+    deliveredAt: { type: Date, default: null },
+    viewedAt: { type: Date, default: null },
+    viewedSource: { type: String, trim: true, default: "" },
+    respondedAt: { type: Date, default: null },
+    responseTimeSeconds: { type: Number, default: null },
+    expiresAt: { type: Date, default: null },
+    expiredAt: { type: Date, default: null },
+    cancelledAt: { type: Date, default: null },
+    failedAt: { type: Date, default: null },
+    rejectionReason: { type: String, trim: true, maxlength: 240, default: "" },
+    failureReason: { type: String, trim: true, maxlength: 240, default: "" },
+    failureTechnicalDetails: { type: String, trim: true, maxlength: 1000, default: "" },
+    expiryReason: { type: String, trim: true, maxlength: 240, default: "" },
+    cancellationReason: { type: String, trim: true, maxlength: 240, default: "" },
+    notification: {
+      notificationId: { type: String, trim: true, default: "" },
+      pushStatus: { type: String, enum: ["pending", "sent", "failed", "skipped"], default: "pending" },
+      pushSuccessCount: { type: Number, default: 0 },
+      pushFailureCount: { type: Number, default: 0 },
+      technicalDetails: { type: String, trim: true, maxlength: 1000, default: "" }
+    }
+  },
+  { _id: false }
+);
+
+const bookingSchema = new mongoose.Schema(
+  {
+    // Canonical public ID generated once by the customer app. Sparse keeps all
+    // existing production rows valid while enforcing uniqueness for new flow.
+    bookingId: { type: String, trim: true, unique: true, sparse: true, index: true },
+    bookingCode: { type: String, required: true, unique: true, index: true },
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    partnerId: { type: mongoose.Schema.Types.ObjectId, ref: "Partner", default: null, index: true },
+    serviceCategory: { type: String, required: true, index: true },
+    serviceName: { type: String, default: "Service" },
+    issue: { type: String, default: "Service request" },
+    formAnswers: { type: mongoose.Schema.Types.Mixed, default: {} },
+    formSchemaVersion: { type: Number, default: 0 },
+    appConfigVersion: { type: Number, default: 0 },
+    address: { type: String, required: true },
+    addressDetails: {
+      houseFlat: { type: String, trim: true, default: "" },
+      building: { type: String, trim: true, default: "" },
+      floor: { type: String, trim: true, default: "" },
+      room: { type: String, trim: true, default: "" },
+      landmark: { type: String, trim: true, default: "" }
+    },
+    city: { type: String, default: "Guwahati", index: true },
+    location: { type: pointSchema, default: () => ({ type: "Point", coordinates: [0, 0] }) },
+    locationVersion: { type: Number, default: 1, min: 1 },
+    locationUpdatedAt: { type: Date, default: Date.now },
+    locationUpdatedBy: { type: String, enum: ["user", "admin", "system"], default: "user" },
+    locationChange: {
+      state: { type: String, enum: ["none", "pending_partner_ack", "accepted", "rejected"], default: "none" },
+      reason: { type: String, trim: true, default: "" },
+      changedAt: { type: Date, default: null },
+      respondedAt: { type: Date, default: null },
+      changedBy: { type: String, trim: true, default: "" }
+    },
+    contact: {
+      primaryPhone: { type: String, trim: true, default: "" },
+      alternatePhone: { type: String, trim: true, default: "" },
+      updatedAt: { type: Date, default: Date.now },
+      updatedBy: { type: String, trim: true, default: "user" }
+    },
+    status: { type: String, enum: BOOKING_STATUSES, default: "pending", index: true },
+    emergency: {
+      isEmergency: { type: Boolean, default: false, index: true },
+      type: {
+        type: String,
+        enum: ["none", "electric_short_circuit", "water_leakage", "ac_breakdown", "other"],
+        default: "none",
+        index: true
+      },
+      priority: { type: String, enum: ["normal", "urgent", "critical"], default: "normal", index: true },
+      notes: { type: String, default: "" },
+      requestedAt: { type: Date, default: null }
+    },
+    price: { type: Number, default: 0 },
+    finalAmount: { type: Number, default: 0 },
+    grossAmount: { type: Number, default: 0 },
+    discount: {
+      ruleId: { type: mongoose.Schema.Types.ObjectId, ref: "DiscountRule", default: null },
+      name: { type: String, default: "" },
+      type: { type: String, default: "" },
+      value: { type: Number, default: 0 },
+      amount: { type: Number, default: 0 },
+      appliedAt: { type: Date, default: null }
+    },
+    adminDiscount: {
+      amount: { type: Number, default: 0 },
+      reason: { type: String, default: "" },
+      appliedBy: { type: String, default: "" },
+      appliedAt: { type: Date, default: null }
+    },
+    workCompletion: {
+      completedTasks: [{ type: String, trim: true, maxlength: 160 }],
+      additionalWork: { type: String, trim: true, maxlength: 1000, default: "" },
+      partnerNotes: { type: String, trim: true, maxlength: 1000, default: "" },
+      submittedBy: { type: String, trim: true, maxlength: 120, default: "" },
+      submittedAt: { type: Date, default: null }
+    },
+    serviceWorkDetails: {
+      description: { type: String, trim: true, maxlength: 1000, default: "" },
+      completedTasks: [{
+        taskId: { type: String, trim: true, maxlength: 100 },
+        name: { type: String, trim: true, maxlength: 160 }
+      }],
+      customWork: [{ type: String, trim: true, maxlength: 160 }],
+      additionalNotes: { type: String, trim: true, maxlength: 1000, default: "" },
+      checklistVersion: { type: Number, min: 1, default: 1 },
+      submittedBy: { type: String, trim: true, maxlength: 120, default: "" },
+      submittedAt: { type: Date, default: null }
+    },
+    amountRequestedAt: { type: Date, default: null },
+    paymentStatus: { type: String, enum: ["pending", "paid", "failed", "refunded"], default: "pending" },
+    customerVerification: {
+      phoneVerified: { type: Boolean, default: false },
+      otpRequired: { type: Boolean, default: false },
+      authPhone: { type: String, default: "" },
+      verifiedAt: { type: Date, default: null },
+      riskStatus: { type: String, default: "unknown" }
+    },
+    quoteAmount: { type: Number, default: 0 },
+    quoteStatus: {
+      type: String,
+      enum: ["none", "pending", "payment_submitted", "approved", "countered", "expired", "rejected"],
+      default: "none",
+      index: true
+    },
+    quoteRequestedAt: { type: Date, default: null },
+    paymentSubmittedAt: { type: Date, default: null },
+    quoteExpiresAt: { type: Date, default: null },
+    quoteApprovedAt: { type: Date, default: null },
+    quoteCounterAmount: { type: Number, default: 0 },
+    quoteCounterMessage: { type: String, default: "" },
+    quoteCounterAt: { type: Date, default: null },
+    quoteHistory: [
+      {
+        kind: String,
+        amount: Number,
+        by: String,
+        message: String,
+        at: Date
+      }
+    ],
+    noResponseReport: {
+      reported: { type: Boolean, default: false },
+      reportedAt: { type: Date, default: null },
+      reason: { type: String, default: "" },
+      lat: { type: Number, default: 0 },
+      lng: { type: Number, default: 0 },
+      accuracy: { type: Number, default: 9999 },
+      evidenceUrl: { type: String, default: "" }
+    },
+    reviewSnapshot: {
+      reviewId: { type: mongoose.Schema.Types.ObjectId, ref: "Review", default: null },
+      rating: { type: Number, default: 0 },
+      status: { type: String, default: "" },
+      disputeStatus: { type: String, default: "none" },
+      reviewedAt: { type: Date, default: null }
+    },
+    requestedPartners: [{ type: mongoose.Schema.Types.ObjectId, ref: "Partner" }],
+    rejectedPartners: [{ type: mongoose.Schema.Types.ObjectId, ref: "Partner" }],
+    // The historical request log is additive: legacy bookings without this
+    // field remain valid while new dispatches expose a complete admin audit.
+    partnerRequests: { type: [partnerRequestSchema], default: [] },
+    dispatchRadiusKm: { type: Number, default: 0 },
+    dispatchMode: {
+      type: String,
+      enum: ["", "customer_location", "city_fallback", "guwahati_service_area_fallback", "location_required"],
+      default: ""
+    },
+    dispatchAttempt: { type: Number, default: 0 },
+    dispatchedAt: { type: Date, default: null },
+    requestExpiresAt: { type: Date, default: null, index: true },
+    requestExpiredAt: { type: Date, default: null },
+    expiryReason: { type: String, trim: true, default: "" },
+    userSnapshot: {
+      name: String,
+      phone: String,
+      email: String,
+      fcmToken: String
+    },
+    partnerSnapshot: {
+      name: String,
+      phone: String,
+      rating: Number,
+      ratingCount: { type: Number, default: 0 },
+      photoUrl: String,
+      fcmToken: String
+    },
+    laundryAssignment: {
+      ownerPartnerId: { type: mongoose.Schema.Types.ObjectId, ref: "Partner", default: null },
+      staffSequence: { type: Number, default: 0 },
+      staffName: { type: String, trim: true, default: "" },
+      staffPhone: { type: String, trim: true, default: "" },
+      staffPhoneHash: { type: String, trim: true, default: "" },
+      staffEmailHash: { type: String, trim: true, default: "" },
+      staffFirebaseUid: { type: String, trim: true, default: "" },
+      taskStatus: {
+        type: String,
+        enum: ["unassigned", "assigned", "in_progress", "completed"],
+        default: "unassigned"
+      },
+      assignedAt: { type: Date, default: null },
+      startedAt: { type: Date, default: null },
+      completedAt: { type: Date, default: null }
+    },
+    cleaningTeam: [{
+      staffSequence: { type: Number, required: true, min: 1 },
+      staffName: { type: String, trim: true, default: "" },
+      staffPhone: { type: String, trim: true, default: "" },
+      staffPhoneHash: { type: String, trim: true, default: "" },
+      staffEmailHash: { type: String, trim: true, default: "" },
+      staffFirebaseUid: { type: String, trim: true, default: "" },
+      assignedAt: { type: Date, default: Date.now }
+    }],
+    pickupAssignment: {
+      ownerPartnerId: { type: mongoose.Schema.Types.ObjectId, ref: "Partner", default: null },
+      staffSequence: { type: Number, default: 0 },
+      staffName: { type: String, trim: true, default: "" },
+      staffPhone: { type: String, trim: true, default: "" },
+      staffPhoneHash: { type: String, trim: true, default: "" },
+      staffEmailHash: { type: String, trim: true, default: "" },
+      staffFirebaseUid: { type: String, trim: true, default: "" },
+      taskStatus: { type: String, enum: ["unassigned", "assigned", "in_progress", "completed"], default: "unassigned" },
+      assignedAt: { type: Date, default: null },
+      startedAt: { type: Date, default: null },
+      completedAt: { type: Date, default: null }
+    },
+    deliveryAssignment: {
+      ownerPartnerId: { type: mongoose.Schema.Types.ObjectId, ref: "Partner", default: null },
+      staffSequence: { type: Number, default: 0 },
+      staffName: { type: String, trim: true, default: "" },
+      staffPhone: { type: String, trim: true, default: "" },
+      staffPhoneHash: { type: String, trim: true, default: "" },
+      staffEmailHash: { type: String, trim: true, default: "" },
+      staffFirebaseUid: { type: String, trim: true, default: "" },
+      taskStatus: { type: String, enum: ["unassigned", "assigned", "in_progress", "completed"], default: "unassigned" },
+      assignedAt: { type: Date, default: null },
+      startedAt: { type: Date, default: null },
+      completedAt: { type: Date, default: null }
+    },
+    slot: { type: String, default: "" },
+    // -----------------------------------------------------------------
+    // Scheduling / booking-type fields
+    // -----------------------------------------------------------------
+    // bookingType:
+    //   "instant"   → customer wants a worker within ~2 hours (default,
+    //                 existing behaviour — no change to dispatch logic)
+    //   "scheduled" → customer chose a specific date + half-day slot;
+    //                 only partners who declared availability for that
+    //                 slot will be dispatched to
+    bookingType: {
+      type: String,
+      enum: ["instant", "scheduled"],
+      default: "instant",
+      index: true
+    },
+    // scheduledDate: "YYYY-MM-DD" in IST, set only when bookingType = "scheduled"
+    scheduledDate: { type: String, trim: true, default: "" },
+    // scheduledSlot: which half-day window the customer chose
+    //   morning   → 06:00 – 12:00 IST
+    //   afternoon → 12:00 – 17:00 IST
+    //   evening   → 17:00 – 22:00 IST
+    scheduledSlot: {
+      type: String,
+      enum: ["", "morning", "afternoon", "evening"],
+      default: ""
+    },
+    // Human-readable label shown to both customer and partner, e.g. "Today Morning (6am–12pm)"
+    scheduledSlotLabel: { type: String, trim: true, default: "" },
+    partnerArrivalEstimateMinutes: { type: Number, default: 0, min: 0, max: 1440 },
+    partnerArrivalEstimateLabel: { type: String, default: "" },
+    expectedArrivalAt: { type: Date, default: null },
+    acceptedAt: { type: Date, default: null },
+    completedAt: { type: Date, default: null },
+    warranty: {
+      eligible: { type: Boolean, default: false, index: true },
+      serviceDate: { type: Date, default: null },
+      warrantyDays: { type: Number, default: 0 },
+      warrantyEndDate: { type: Date, default: null, index: true },
+      revisitRequested: { type: Boolean, default: false },
+      revisitRequestId: { type: mongoose.Schema.Types.ObjectId, ref: "RevisitRequest", default: null }
+    },
+    proofSummary: {
+      beforeCount: { type: Number, default: 0 },
+      afterCount: { type: Number, default: 0 },
+      lastUploadedAt: { type: Date, default: null }
+    },
+    completionAccounting: {
+      creditedAt: { type: Date, default: null },
+      grossAmount: { type: Number, default: 0 }
+    },
+    latestSosId: { type: mongoose.Schema.Types.ObjectId, ref: "TechnicianSos", default: null },
+    statusTimeline: [
+      {
+        status: String,
+        at: Date,
+        by: String,
+        note: String
+      }
+    ]
+  },
+  { timestamps: true }
+);
+
+bookingSchema.index({ location: "2dsphere" });
+bookingSchema.index({ serviceCategory: 1, status: 1, city: 1, createdAt: -1 });
+bookingSchema.index({ status: 1, serviceCategory: 1, createdAt: -1 });
+bookingSchema.index({ userId: 1, createdAt: -1 });
+bookingSchema.index({ partnerId: 1, createdAt: -1 });
+bookingSchema.index({ partnerId: 1, status: 1, updatedAt: -1 });
+bookingSchema.index({ status: 1, createdAt: -1 });
+bookingSchema.index({ status: 1, serviceCategory: 1, city: 1, rejectedPartners: 1, createdAt: -1 });
+bookingSchema.index({ requestedPartners: 1, status: 1, createdAt: -1 });
+bookingSchema.index({ "partnerRequests.partnerId": 1, createdAt: -1 });
+bookingSchema.index({ quoteStatus: 1, quoteExpiresAt: 1 });
+bookingSchema.index({ paymentStatus: 1, updatedAt: -1 });
+bookingSchema.index({ "emergency.isEmergency": 1, "emergency.priority": 1, status: 1, createdAt: -1 });
+bookingSchema.index({ "warranty.warrantyEndDate": 1, "warranty.revisitRequested": 1 });
+bookingSchema.index({ "completionAccounting.creditedAt": 1, status: 1 });
+bookingSchema.index({ "laundryAssignment.ownerPartnerId": 1, "laundryAssignment.staffPhoneHash": 1, updatedAt: -1 });
+bookingSchema.index({ "laundryAssignment.staffFirebaseUid": 1, updatedAt: -1 });
+bookingSchema.index({ "laundryAssignment.staffEmailHash": 1, updatedAt: -1 });
+// Scheduled-booking dispatch: find unassigned scheduled bookings for a given date+slot
+bookingSchema.index({ bookingType: 1, scheduledDate: 1, scheduledSlot: 1, status: 1 });
+bookingSchema.plugin(publicIdPlugin, { kind: "booking" });
+bookingSchema.plugin(encryptedFieldsPlugin, {
+  fields: [
+    "serviceName",
+    "issue",
+    "address",
+    "addressDetails.houseFlat",
+    "addressDetails.building",
+    "addressDetails.floor",
+    "addressDetails.room",
+    "addressDetails.landmark",
+    "locationChange.reason",
+    "contact.primaryPhone",
+    "contact.alternatePhone",
+    "slot",
+    "partnerArrivalEstimateLabel",
+    "emergency.notes",
+    "quoteCounterMessage",
+    "quoteHistory.message",
+    "customerVerification.authPhone",
+    "noResponseReport.reason",
+    "noResponseReport.evidenceUrl",
+    "userSnapshot.name",
+    "userSnapshot.phone",
+    "userSnapshot.email",
+    "userSnapshot.fcmToken",
+    "partnerSnapshot.name",
+    "partnerSnapshot.phone",
+    "partnerSnapshot.fcmToken",
+    "partnerRequests.partnerSnapshot.name",
+    "partnerRequests.partnerSnapshot.phone",
+    "partnerRequests.rejectionReason",
+    "partnerRequests.failureTechnicalDetails",
+    "laundryAssignment.staffName",
+    "cleaningTeam.staffName",
+    "cleaningTeam.staffPhone"
+  ]
+});
+
+module.exports = {
+  Booking: mongoose.model("Booking", bookingSchema),
+  BOOKING_STATUSES
+};
