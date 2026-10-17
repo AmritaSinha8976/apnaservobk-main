@@ -1,0 +1,46 @@
+name: Keep backends warm
+
+# Render's free instances spin down after ~15 minutes of inactivity, and the
+# first request after that takes 30-60s to cold-start. That cold start is what
+# shows up in the apps as lag followed by a "Server is waking up..." / fallback
+# error. This workflow pings both backends on a schedule so they stay awake.
+#
+# Notes:
+# - GitHub cron is best-effort; it can run a few minutes late under load, so we
+#   ping every 10 minutes to stay comfortably under the ~15 min idle window.
+# - A single HTTP GET to /health is enough to reset the idle timer.
+# - Free-tier Render still has a monthly usage cap. Keeping two services warm
+#   24/7 can exhaust it; if that happens, either reduce the schedule, keep only
+#   the primary warm, or move the service to a paid plan (which never sleeps).
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: keep-warm
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        url:
+          - https://apnaservobk-98gz.onrender.com/health
+          - https://apnaservobk-netx.onrender.com/health
+    steps:
+      - name: Ping ${{ matrix.url }}
+        run: |
+          echo "Pinging ${{ matrix.url }}"
+          # --max-time 90 covers a cold start (30-60s). A non-2xx/3xx or a
+          # timeout fails the job so a broken deploy is visible in the Actions tab.
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 90 --retry 2 --retry-delay 5 "${{ matrix.url }}")
+          echo "HTTP $code"
+          case "$code" in
+            2*|3*) echo "OK"; exit 0 ;;
+            *) echo "Unexpected status $code"; exit 1 ;;
+          esac
